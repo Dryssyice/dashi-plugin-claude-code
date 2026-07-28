@@ -99,6 +99,85 @@ class BuildPromptTest(unittest.TestCase):
             self.assertIn("Do the thing", prompt)
 
 
+class NormalizePayloadTest(unittest.TestCase):
+    """Payloads without title/body must still reach the agent with content.
+
+    Real production senders used {"type","summary"}, {"what","why","evidence"}
+    and {"request"}; the listener read only title/body, so those arrived as an
+    empty envelope and were closed as empty tasks.
+    """
+
+    def test_research_payload_gets_title_and_body(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            module = _load_listener(Path(raw))
+            payload = module.normalize_payload({
+                "type": "research_result",
+                "summary": "Task 9 complete. Skill is a repackager, not a growth system.",
+                "findings": {"must": 4, "should": 8},
+            })
+            self.assertIn("Task 9 complete", payload["title"])
+            self.assertIn("research_result", payload["body"])
+            self.assertIn("must", payload["body"])
+
+    def test_monitoring_payload_uses_what_as_title(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            module = _load_listener(Path(raw))
+            payload = module.normalize_payload({
+                "type": "monitoring_finding",
+                "what": "ACLs block memory-audit coverage",
+                "evidence": ["cannot read 20-daily", "cannot read 70-runbooks"],
+            })
+            self.assertEqual(payload["title"], "ACLs block memory-audit coverage")
+            self.assertIn("- cannot read 20-daily", payload["body"])
+
+    def test_explicit_title_and_body_are_untouched(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            module = _load_listener(Path(raw))
+            payload = module.normalize_payload({
+                "title": "Report from marketer",
+                "body": "two bullets",
+                "summary": "should not override title",
+            })
+            self.assertEqual(payload["title"], "Report from marketer")
+            self.assertEqual(payload["body"], "two bullets")
+
+    def test_envelope_keys_stay_out_of_body(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            module = _load_listener(Path(raw))
+            payload = module.normalize_payload({
+                "summary": "do the thing",
+                "task_id": "tid-1",
+                "from_agent": "scout",
+                "_delivery_id": 7,
+            })
+            self.assertNotIn("tid-1", payload["body"])
+            self.assertNotIn("scout", payload["body"])
+
+    def test_long_title_is_truncated(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            module = _load_listener(Path(raw))
+            payload = module.normalize_payload({"summary": "x" * 400})
+            self.assertLessEqual(len(payload["title"]), module._TITLE_MAX)
+
+    def test_empty_payload_stays_empty(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            module = _load_listener(Path(raw))
+            payload = module.normalize_payload({})
+            self.assertEqual(payload, {})
+
+    def test_build_prompt_renders_untitled_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            module = _load_listener(Path(raw))
+            prompt = module._build_prompt({
+                "from_agent": "bob",
+                "task_id": "tid-9",
+                "type": "monitoring_finding",
+                "what": "heartbeat registration fails",
+            })
+            self.assertIn("heartbeat registration fails", prompt)
+            self.assertNotIn("Title: (no title)", prompt)
+
+
 class NotifyOwnerTest(unittest.TestCase):
     def test_notify_owner_noop_without_chat_id(self) -> None:
         """When WEBHOOK_OWNER_CHAT_ID is unset, _notify_owner is a silent no-op."""

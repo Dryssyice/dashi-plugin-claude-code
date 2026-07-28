@@ -111,7 +111,80 @@ def _sanitize_task_id(raw: str) -> str:
     return _SAFE_TASK_ID.sub("_", raw)[:64] or "no-id"
 
 
+# Keys the listener consumes structurally; never folded into the synthesized
+# body, otherwise the prompt repeats routing metadata as if it were content.
+_ENVELOPE_KEYS = frozenset({
+    "title", "body", "context", "task_id", "_task_id", "from_agent", "from",
+    "_enriched_from", "_delivery_id", "_origin_task",
+})
+
+# Fields senders commonly use as the headline instead of `title`, in priority
+# order. Real payloads seen in production: {"type","summary",...} from research
+# agents, {"what","why","evidence"} from monitors, {"request"} from blocked
+# agents. Before this fallback existed they all rendered as "(no title)" with
+# an empty body, and the receiving agent closed them as empty tasks.
+_TITLE_FALLBACK_KEYS = ("summary", "what", "request", "action_needed", "type")
+
+_TITLE_MAX = 120
+
+
+def _stringify(value: object) -> str:
+    """Render a payload value as prompt text. Lists become bullet lines.
+
+    A missing key must render as empty, not as the literal "None" — otherwise
+    the first absent fallback key wins the title with garbage.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, (list, tuple)):
+        return "\n".join(f"- {_stringify(v)}" for v in value if v not in (None, ""))
+    if isinstance(value, dict):
+        return "\n".join(f"- {k}: {_stringify(v)}" for k, v in value.items())
+    return str(value)
+
+
+def normalize_payload(payload: dict) -> dict:
+    """Guarantee `title` and `body` regardless of the sender's field naming.
+
+    The swarm bus accepts any JSON payload, but this listener only ever read
+    `title`/`body`. Senders that used other field names were delivered as an
+    empty envelope. Rather than force every agent to change, synthesize the
+    two fields from whatever the payload carries and leave explicit
+    `title`/`body` untouched when present.
+
+    Returns the same dict (mutated in place) for call-site convenience.
+    """
+    if not isinstance(payload, dict):
+        return payload
+
+    if not payload.get("title"):
+        for key in _TITLE_FALLBACK_KEYS:
+            candidate = _stringify(payload.get(key))
+            if candidate:
+                first_line = candidate.splitlines()[0].strip()
+                if len(first_line) > _TITLE_MAX:
+                    first_line = first_line[:_TITLE_MAX - 1].rstrip() + "…"
+                payload["title"] = first_line
+                break
+
+    if not payload.get("body"):
+        parts = []
+        for key, value in payload.items():
+            if key in _ENVELOPE_KEYS or value in (None, "", [], {}):
+                continue
+            rendered = _stringify(value)
+            if rendered:
+                parts.append(f"{key}:\n{rendered}" if "\n" in rendered else f"{key}: {rendered}")
+        if parts:
+            payload["body"] = "\n\n".join(parts)
+
+    return payload
+
+
 def _build_prompt(payload: dict) -> str:
+    payload = normalize_payload(payload)
     from_agent = payload.get("from_agent") or payload.get("from") or "unknown"
     raw_task_id = payload.get("task_id") or payload.get("_task_id") or "no-id"
     task_id = _sanitize_task_id(str(raw_task_id))
@@ -309,7 +382,7 @@ async def _fetch_pending_task(agent: str) -> dict | None:
 
         deliveries.sort(key=_sort_key, reverse=True)
         top = deliveries[0]
-        inner = top.get("payload") or {}
+        inner = normalize_payload(top.get("payload") or {})
         return {
             "from_agent": top.get("from_agent") or inner.get("from_agent") or "unknown",
             "task_id": str(
@@ -435,6 +508,9 @@ async def handle_webhook(request: web.Request) -> web.Response:
         task_id = _sanitize_task_id(str(task_id))
         payload["task_id"] = task_id
 
+    # Synthesize title/body before the owner ping so the Telegram pre-ack
+    # shows what the task is about, not "(no title)".
+    normalize_payload(payload)
     title = payload.get("title") or "(no title)"
     await _notify_owner(from_agent, task_id, title)
 
