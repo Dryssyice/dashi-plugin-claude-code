@@ -163,7 +163,7 @@ export class ProgressReporter {
   /**
    * Read-only: returns true if a Claude session is actively running tools
    * for this chat — used by InboundWatcher to decide whether to auto-reply
-   * «Тралл занят». Definition:
+   * «Занят». Definition:
    *   entry exists AND !entry.stopped AND (now - lastActivityMs) < threshold
    *
    * `thresholdMs` is REQUIRED — the watcher owns the threshold via its
@@ -194,7 +194,7 @@ export class ProgressReporter {
    *   accounts for the gap between `tool_end` and the next `tool_start`.
    *   Returning `undefined` here during that brief idle window would cause
    *   false-negative auto-replies (the watcher would see «not busy» and
-   *   suppress the «Тралл занят» message even though Claude is about to
+   *   suppress the «Занят» message even though Claude is about to
    *   call the next tool any millisecond now).
    *
    *   `tool_end` is render-only inside this module (see applyEvent) — it

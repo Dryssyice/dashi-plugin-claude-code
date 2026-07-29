@@ -356,4 +356,19 @@ describe('InboundWatcher', () => {
   test('composeAutoReply: known tool name appears wrapped in <code>', () => {
     expect(composeAutoReply('Read')).toContain('<code>Read</code>')
   })
+
+  // Goes RED on the upstream text «🔧 Тралл занят, активный инструмент: …».
+  //
+  // The reply names nobody on purpose. One deployment runs one agent, and the
+  // operator already knows which bot answered him — the name adds no
+  // information to a message he can only receive from one session. Upstream's
+  // name is a character out of somebody else's swarm, which is worse than
+  // useless: it tells our operator that a stranger is busy.
+  //
+  // Pinned by the opening of the sentence rather than by `not.toContain(<name>)`
+  // — a negative assertion against one name passes for every other name too.
+  test('composeAutoReply: the reply names no agent', () => {
+    const text = composeAutoReply('Bash')
+    expect(text.startsWith('🔧 Занят, активный инструмент:')).toBe(true)
+  })
 })

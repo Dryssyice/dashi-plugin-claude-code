@@ -1,4 +1,4 @@
-// InboundWatcher — auto-reply «Тралл занят» when the warchief sends plain
+// InboundWatcher — auto-reply «Занят» when the warchief sends plain
 // text while a Claude session is mid-tool. Sits between OOB resolution and
 // the gate/notify call in `handleInboundText` — OOB always takes priority,
 // and the watcher NEVER replaces the channel notification (auto-reply AND
@@ -16,8 +16,12 @@
 //
 // Tone constraints (rules.md):
 //   * No emoji in production paths. The warchief explicitly asked for «🔧»
-//     prefix on auto-reply (visual cue that Тралл is mid-tool — single
+//     prefix on auto-reply (visual cue that the agent is mid-tool — single
 //     character, anchored, NOT a decorative emoji string).
+//   * The reply names NOBODY. One deployment runs one agent, so the operator
+//     already knows which session answered him and a name adds nothing; and the
+//     name upstream ships belongs to an agent in somebody else's swarm, which
+//     told our operator that a stranger was busy. Operator's call 2026-07-30.
 //   * HTML output through `escapeHtml` for the tool name; the safe-wrapper
 //     also validates HTML before send.
 
@@ -163,5 +167,5 @@ export class InboundWatcher {
  */
 export function composeAutoReply(toolName: string | undefined): string {
   const tool = toolName ?? '…'
-  return `🔧 Тралл занят, активный инструмент: <code>${escapeHtml(tool)}</code>. Жди или /stop.`
+  return `🔧 Занят, активный инструмент: <code>${escapeHtml(tool)}</code>. Жди или /stop.`
 }

@@ -711,7 +711,7 @@ if (resolveTaskReconcilerEnabled()) {
   process.once('SIGTERM', shutdownReality)
 }
 
-// InboundWatcher (PR-A3, 2026-05-20) — auto-reply «Тралл занят» when the
+// InboundWatcher (PR-A3, 2026-05-20) — auto-reply «Занят» when the
 // warchief sends plain text while ProgressReporter says the session is
 // mid-tool. The watcher receives `progressReporter` for read-only busy
 // detection — never mutates reporter state. Debounce + safe-api enforced
