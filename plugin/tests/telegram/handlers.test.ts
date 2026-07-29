@@ -76,6 +76,7 @@ function makeConfig(overrides: Partial<AppConfig> = {}): AppConfig {
       enabled: true,
       debounce_ms: 10_000,
       busy_threshold_ms: 30_000,
+      agent_name: '',
     },
     tmux_mirror: { enabled: false, pane_target: '', socket_name: '', poll_interval_ms: 5000, line_count: 50, hide_segments: ['boot_banner', 'inbound_warning', 'footer_hints', 'input_box'], mode: 'latest_inbound_only', max_lines: 14 },
     multichat: { enabled: false },
@@ -535,11 +536,15 @@ describe('handleInboundText — InboundWatcher (PR-A3)', () => {
     await handleInboundText(ctx, deps)
     await new Promise((r) => setTimeout(r, 0))
 
-    // /help replies via sendMessage but the auto-reply «🔧 Тралл занят» must
-    // NOT appear — OOB short-circuits before the watcher hook. The single
-    // sendMessage we see is the /help body itself.
+    // /help replies via sendMessage but the busy auto-reply must NOT appear —
+    // OOB short-circuits before the watcher hook. The single sendMessage we
+    // see is the /help body itself.
+    //
+    // Assert on the part of the sentence the agent does NOT get to rename: the
+    // name in front of «занят» is configurable now, so pinning the old name
+    // here would leave a test that passes no matter what the watcher sends.
     expect(sendCalls.length).toBe(1)
-    expect(sendCalls[0]!.text).not.toContain('Тралл занят')
+    expect(sendCalls[0]!.text).not.toContain('занят, активный инструмент')
     // OOB handled inline — no channel notify.
     expect(serverSpy.calls.length).toBe(0)
     rmSync(statePaths.root, { recursive: true, force: true })

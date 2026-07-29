@@ -89,6 +89,7 @@ function makeConfig(overrides: Partial<AppConfig['status']> = {}): AppConfig {
       enabled: true,
       debounce_ms: 10_000,
       busy_threshold_ms: 30_000,
+      agent_name: '',
     },
     tmux_mirror: {
       enabled: false,

@@ -110,6 +110,7 @@ function makeConfig(): AppConfig {
       enabled: true,
       debounce_ms: 10_000,
       busy_threshold_ms: 30_000,
+      agent_name: '',
     },
     tmux_mirror: { enabled: false, pane_target: '', socket_name: '', poll_interval_ms: 5000, line_count: 50, hide_segments: ['boot_banner', 'inbound_warning', 'footer_hints', 'input_box'], mode: 'latest_inbound_only', max_lines: 14 },
     multichat: { enabled: false },

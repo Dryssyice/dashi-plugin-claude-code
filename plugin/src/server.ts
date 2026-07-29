@@ -276,6 +276,7 @@ const env = RuntimeEnvSchema.parse({
   ...(process.env.TELEGRAM_MEMORY_LOGS_PATH !== undefined ? { TELEGRAM_MEMORY_LOGS_PATH: process.env.TELEGRAM_MEMORY_LOGS_PATH } : {}),
   ...(process.env.TELEGRAM_MEMORY_SOURCE_TAG !== undefined ? { TELEGRAM_MEMORY_SOURCE_TAG: process.env.TELEGRAM_MEMORY_SOURCE_TAG } : {}),
   ...(process.env.TELEGRAM_MEMORY_AGENT_LABEL !== undefined ? { TELEGRAM_MEMORY_AGENT_LABEL: process.env.TELEGRAM_MEMORY_AGENT_LABEL } : {}),
+  ...(process.env.TELEGRAM_WATCHER_AGENT_NAME !== undefined ? { TELEGRAM_WATCHER_AGENT_NAME: process.env.TELEGRAM_WATCHER_AGENT_NAME } : {}),
   ...(process.env.TELEGRAM_MULTICHAT_ENABLED !== undefined ? { TELEGRAM_MULTICHAT_ENABLED: process.env.TELEGRAM_MULTICHAT_ENABLED } : {}),
   ...(process.env.TELEGRAM_MULTICHAT_POLICY_PATH !== undefined ? { TELEGRAM_MULTICHAT_POLICY_PATH: process.env.TELEGRAM_MULTICHAT_POLICY_PATH } : {}),
   ...(process.env.TELEGRAM_MULTICHAT_STATE_DIR !== undefined ? { TELEGRAM_MULTICHAT_STATE_DIR: process.env.TELEGRAM_MULTICHAT_STATE_DIR } : {}),
@@ -711,7 +712,7 @@ if (resolveTaskReconcilerEnabled()) {
   process.once('SIGTERM', shutdownReality)
 }
 
-// InboundWatcher (PR-A3, 2026-05-20) — auto-reply «Тралл занят» when the
+// InboundWatcher (PR-A3, 2026-05-20) — auto-reply «<agent> занят» when the
 // warchief sends plain text while ProgressReporter says the session is
 // mid-tool. The watcher receives `progressReporter` for read-only busy
 // detection — never mutates reporter state. Debounce + safe-api enforced

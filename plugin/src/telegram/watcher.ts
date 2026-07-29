@@ -1,4 +1,4 @@
-// InboundWatcher — auto-reply «Тралл занят» when the warchief sends plain
+// InboundWatcher — auto-reply «<agent> занят» when the warchief sends plain
 // text while a Claude session is mid-tool. Sits between OOB resolution and
 // the gate/notify call in `handleInboundText` — OOB always takes priority,
 // and the watcher NEVER replaces the channel notification (auto-reply AND
@@ -16,8 +16,13 @@
 //
 // Tone constraints (rules.md):
 //   * No emoji in production paths. The warchief explicitly asked for «🔧»
-//     prefix on auto-reply (visual cue that Тралл is mid-tool — single
+//     prefix on auto-reply (visual cue that the agent is mid-tool — single
 //     character, anchored, NOT a decorative emoji string).
+//   * The agent names ITSELF in the reply. One deployment runs one agent, and
+//     a fleet of them answering with the same generic word leaves the operator
+//     guessing which session is busy. Name comes from `watcher.agent_name`,
+//     falling back to the label memory already uses, then to a neutral word —
+//     configuring the same name twice is how the two drift apart.
 //   * HTML output through `escapeHtml` for the tool name; the safe-wrapper
 //     also validates HTML before send.
 
@@ -110,7 +115,7 @@ export class InboundWatcher {
       this.lastReplyMs.set(input.chatId, now)
 
       const toolName = this.progressReporter.getActiveToolName(input.chatId)
-      const text = composeAutoReply(toolName)
+      const text = composeAutoReply(toolName, resolveAgentName(this.config))
 
       try {
         await this.telegramApi.sendMessage(input.chatId, text, {
@@ -158,10 +163,36 @@ export class InboundWatcher {
 }
 
 /**
+ * Which name this deployment answers with.
+ *
+ * Preference order: the watcher's own setting, then the label the memory
+ * writer already stamps on turns, then a neutral fallback. The middle step
+ * exists so a deployment that has already told the plugin who it is does not
+ * have to say it twice — two settings for one name drift apart, and the one
+ * that drifts is always the one nobody looks at.
+ */
+export function resolveAgentName(config: AppConfig): string {
+  // Read defensively even though the schema gives `agent_name` a default. A
+  // config object can reach here without it -- an older config.json, a caller
+  // that assembled AppConfig by hand, a test fixture -- and `maybeAutoReply`
+  // swallows everything it throws. A crash here would not look like a crash:
+  // it would look like a session that had nothing to say.
+  const configured = (config.watcher.agent_name ?? '').trim()
+  if (configured !== '') return configured
+  const label = (config.memory.agent_label ?? '').trim()
+  if (label !== '') return label
+  return 'Агент'
+}
+
+/**
  * Compose the auto-reply body. Exposed for tests so the HTML shape is
  * pinned without invoking the full class.
+ *
+ * The name is escaped like the tool name: it comes from configuration, and
+ * configuration is not a trusted source of HTML.
  */
-export function composeAutoReply(toolName: string | undefined): string {
+export function composeAutoReply(toolName: string | undefined, agentName: string): string {
   const tool = toolName ?? '…'
-  return `🔧 Тралл занят, активный инструмент: <code>${escapeHtml(tool)}</code>. Жди или /stop.`
+  const name = agentName.trim() === '' ? 'Агент' : agentName.trim()
+  return `🔧 ${escapeHtml(name)} занят, активный инструмент: <code>${escapeHtml(tool)}</code>. Жди или /stop.`
 }

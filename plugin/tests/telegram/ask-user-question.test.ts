@@ -129,7 +129,8 @@ function mkConfig(overrides: { allowedUserIds?: number[]; maxPreview?: number; t
     },
     progress: { enabled: false, edit_throttle_ms: 3000, recent_buffer: 10, session_ttl_ms: 600000 },
     task_mirror: { enabled: false, edit_throttle_ms: 3000, session_ttl_ms: 600000, collapse_completed_after: 5 },
-    watcher: { enabled: false, debounce_ms: 10000, busy_threshold_ms: 30000 },
+    watcher: { enabled: false, debounce_ms: 10000, busy_threshold_ms: 30000,
+ agent_name: '', },
     ask_user_question: {
       enabled: true,
       timeout_ms: overrides.timeoutMs ?? 300_000,

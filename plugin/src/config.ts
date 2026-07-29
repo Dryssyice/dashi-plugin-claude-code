@@ -177,6 +177,11 @@ export const AppConfigSchema = z.object({
     enabled: z.boolean().default(true),
     debounce_ms: z.number().int().nonnegative().default(10_000),
     busy_threshold_ms: z.number().int().positive().default(30_000),
+    // Who the auto-reply says is busy. Empty means «fall back» — first to
+    // memory.agent_label, then to a neutral word (see resolveAgentName in
+    // telegram/watcher.ts). A fleet where every session answers with the same
+    // generic name tells the operator that someone is busy and not who.
+    agent_name: z.string().default(''),
   }).default({}),
   // TmuxMirror (2026-05-20) — read-only view of the agent's terminal pane
   // mirrored into one rolling Telegram message via editMessageText. Pulls
@@ -417,6 +422,10 @@ export const RuntimeEnvSchema = z.object({
   TELEGRAM_MEMORY_LOGS_PATH: z.string().optional(),
   TELEGRAM_MEMORY_SOURCE_TAG: z.string().optional(),
   TELEGRAM_MEMORY_AGENT_LABEL: z.string().optional(),
+  // Name the busy auto-reply uses. Env rather than config.json only is the
+  // point: the launchd/systemd unit already knows which agent it is starting,
+  // so the name comes from the same place as the rest of that agent's identity.
+  TELEGRAM_WATCHER_AGENT_NAME: z.string().optional(),
   // PLAN.md Scope A only ships static allowlist mode; `pairing` is reserved
   // for Scope B. We accept both values at the schema level so we can emit
   // a clear, scope-aware error message (the bare `z.enum(['static'])` form
@@ -606,6 +615,13 @@ export function loadConfig(env: NodeJS.ProcessEnv): AppConfig {
   if (parsedEnv.TELEGRAM_MEMORY_SOURCE_TAG !== undefined) memory.source_tag = parsedEnv.TELEGRAM_MEMORY_SOURCE_TAG
   if (parsedEnv.TELEGRAM_MEMORY_AGENT_LABEL !== undefined) memory.agent_label = parsedEnv.TELEGRAM_MEMORY_AGENT_LABEL
   if (Object.keys(memory).length > 0) merged.memory = memory
+
+  // Watcher env overrides. Same pattern as the memory block: take the
+  // config.json sub-object if present, layer env on top, and only emit it when
+  // something is set so Zod can apply its defaults cleanly.
+  const watcher = (merged.watcher && typeof merged.watcher === 'object' ? merged.watcher : {}) as Record<string, unknown>
+  if (parsedEnv.TELEGRAM_WATCHER_AGENT_NAME !== undefined) watcher.agent_name = parsedEnv.TELEGRAM_WATCHER_AGENT_NAME
+  if (Object.keys(watcher).length > 0) merged.watcher = watcher
 
   // Multichat env overrides (Phase 3, 2026-05-23). Same pattern as the
   // memory block: take an existing config.json sub-object if present,

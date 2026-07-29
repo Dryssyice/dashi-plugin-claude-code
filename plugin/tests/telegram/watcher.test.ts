@@ -6,6 +6,7 @@ import { describe, expect, test } from 'bun:test'
 import {
   InboundWatcher,
   composeAutoReply,
+  resolveAgentName,
   type ProgressReporterForWatcher,
 } from '../../src/telegram/watcher.js'
 import type { TelegramApi } from '../../src/channel/tools.js'
@@ -52,6 +53,7 @@ function makeConfig(overrides: Partial<AppConfig['watcher']> = {}): AppConfig {
       enabled: true,
       debounce_ms: 10_000,
       busy_threshold_ms: 30_000,
+      agent_name: 'Кузнец',
       ...overrides,
     },
     tmux_mirror: { enabled: false, pane_target: '', socket_name: '', poll_interval_ms: 5000, line_count: 50, hide_segments: ['boot_banner', 'inbound_warning', 'footer_hints', 'input_box'], mode: 'latest_inbound_only', max_lines: 14 },
@@ -349,11 +351,73 @@ describe('InboundWatcher', () => {
   })
 
   test('composeAutoReply: undefined tool name renders «…» placeholder', () => {
-    const text = composeAutoReply(undefined)
+    const text = composeAutoReply(undefined, 'Кузнец')
     expect(text).toContain('<code>…</code>')
   })
 
   test('composeAutoReply: known tool name appears wrapped in <code>', () => {
-    expect(composeAutoReply('Read')).toContain('<code>Read</code>')
+    expect(composeAutoReply('Read', 'Кузнец')).toContain('<code>Read</code>')
+  })
+
+  test('composeAutoReply: the agent names itself', () => {
+    expect(composeAutoReply('Read', 'Маркетолог')).toContain('Маркетолог занят')
+    expect(composeAutoReply('Read', 'Кузнец')).not.toContain('Маркетолог')
+  })
+
+  test('composeAutoReply: a blank name falls back rather than rendering « занят»', () => {
+    expect(composeAutoReply('Read', '   ')).toContain('Агент занят')
+  })
+
+  test('composeAutoReply: the name is HTML-escaped like the tool name', () => {
+    // Configuration is not a trusted source of HTML: an unescaped name would
+    // break the parse_mode='HTML' send and drop the whole reply, not just the
+    // name.
+    const text = composeAutoReply('Read', '<b>Кузнец</b>')
+    expect(text).toContain('&lt;b&gt;')
+    expect(text).not.toContain('<b>')
+  })
+
+  test('resolveAgentName: watcher setting wins over the memory label', () => {
+    const config = makeConfig({ agent_name: 'Кузнец' })
+    config.memory.agent_label = 'Silvana'
+    expect(resolveAgentName(config)).toBe('Кузнец')
+  })
+
+  test('resolveAgentName: falls back to the memory label when unset', () => {
+    const config = makeConfig({ agent_name: '' })
+    config.memory.agent_label = 'Маркетолог'
+    expect(resolveAgentName(config)).toBe('Маркетолог')
+  })
+
+  test('resolveAgentName: neutral word when neither is configured', () => {
+    const config = makeConfig({ agent_name: '' })
+    expect(resolveAgentName(config)).toBe('Агент')
+  })
+
+  test('a config with no agent_name at all still replies, it does not go silent', async () => {
+    // The schema defaults the field, so this shape can only arrive from an
+    // older config.json or a hand-built AppConfig. It happened during this
+    // very change: reading the missing field threw, maybeAutoReply caught it,
+    // and six tests saw a session that sent nothing while reporting no error.
+    // Silence is the expensive failure here -- the operator waits instead of
+    // learning the agent is busy.
+    const config = makeConfig()
+    delete (config.watcher as { agent_name?: string }).agent_name
+    const { watcher, api } = makeWatcher({
+      config,
+      progress: makeFakeProgress({ busy: true, toolName: 'Bash' }),
+    })
+    const res = await watcher.maybeAutoReply({ chatId: '111', messageId: 42 })
+    expect(res).toEqual({ replied: true })
+    expect(api.calls[0]!.text).toContain('Агент занят')
+  })
+
+  test('the sent auto-reply carries the configured name, not a generic one', async () => {
+    const { watcher, api } = makeWatcher({
+      config: makeConfig({ agent_name: 'Маркетолог' }),
+      progress: makeFakeProgress({ busy: true, toolName: 'Bash' }),
+    })
+    await watcher.maybeAutoReply({ chatId: '111', messageId: 42 })
+    expect(api.calls[0]!.text).toContain('Маркетолог занят')
   })
 })
