@@ -6,7 +6,15 @@
 // records, it does not leak, and it cannot take the server down.
 
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { chmodSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import {
+  chmodSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -93,6 +101,37 @@ describe('logger file sink', () => {
 
     expect(statSync(`${path}.1`).mode & 0o777).toBe(0o600)
     expect(statSync(path).mode & 0o777).toBe(0o600)
+  })
+
+  test('tightens a rotated copy the older version left loose', () => {
+    // The upgrade state, which the case above cannot reach: `.1` was rotated by
+    // the vulnerable version and is already on disk at 0644, while the current
+    // file is fine and nowhere near the rotation threshold. Nothing in the new
+    // ordering would ever look at it.
+    const path = join(dir, 'plugin.log')
+    writeFileSync(path, 'current\n', { mode: 0o600 })
+    chmodSync(path, 0o600)
+    writeFileSync(`${path}.1`, 'left behind by an older version\n', { mode: 0o644 })
+    chmodSync(`${path}.1`, 0o644)
+
+    createLogger('status', { stream: sink(), filePath: path }).info('one emit')
+
+    expect(statSync(`${path}.1`).mode & 0o777).toBe(0o600)
+    expect(statSync(path).mode & 0o777).toBe(0o600)
+  })
+
+  test('does not chmod through a symlink', () => {
+    // A log path an attacker can pre-create as a symlink must not turn the
+    // logger into a chmod primitive on someone else's file.
+    const victim = join(dir, 'victim.txt')
+    writeFileSync(victim, 'not ours\n', { mode: 0o644 })
+    chmodSync(victim, 0o644)
+    const path = join(dir, 'plugin.log')
+    symlinkSync(victim, path)
+
+    createLogger('status', { stream: sink(), filePath: path }).info('through a link')
+
+    expect(statSync(victim).mode & 0o777).toBe(0o644)
   })
 
   test('an unwritable path does not throw', () => {

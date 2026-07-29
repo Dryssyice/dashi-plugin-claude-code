@@ -2,7 +2,17 @@
 // Format: [ISO-ts] [level] [name] message {ctx-json}
 // Output goes to stderr by default so it doesn't poison the MCP stdio transport.
 
-import { appendFileSync, chmodSync, mkdirSync, renameSync, statSync } from 'node:fs'
+import {
+  appendFileSync,
+  closeSync,
+  constants,
+  fchmodSync,
+  fstatSync,
+  mkdirSync,
+  openSync,
+  renameSync,
+  statSync,
+} from 'node:fs'
 import { dirname } from 'node:path'
 
 import { redactToken } from './config.js'
@@ -87,14 +97,24 @@ function rotateIfLarge(path: string, limit: number): void {
 }
 
 function tightenIfLoose(path: string): void {
+  let fd: number | undefined
   try {
-    const mode = statSync(path).mode & 0o777
     // `mode` on appendFileSync applies only when the file is created, so a log
     // that already exists keeps whatever permissions it had -- including
     // world-readable. Redaction removes tokens, not the conversation.
-    if ((mode & 0o077) !== 0) chmodSync(path, 0o600)
+    //
+    // Opened with O_NOFOLLOW and tightened through the descriptor rather than
+    // the path: a log path someone can pre-create as a symlink would otherwise
+    // have us chmod whatever it points at. Refusing to follow costs one log
+    // line; following costs someone else's file.
+    fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW)
+    const mode = fstatSync(fd).mode & 0o777
+    if ((mode & 0o077) !== 0) fchmodSync(fd, 0o600)
   } catch {
-    // Not there yet: the append below creates it with the right mode.
+    // Not there yet, or a symlink we decline to follow: the append below
+    // creates it with the right mode.
+  } finally {
+    if (fd !== undefined) closeSync(fd)
   }
 }
 
@@ -106,6 +126,12 @@ function appendToFile(path: string, line: string, limit: number): void {
     // afterwards fixes only the empty file about to be created and leaves the
     // whole rotated conversation world-readable.
     tightenIfLoose(path)
+    // The rotated copy is checked on its own, because upgrading the code does
+    // not rewrite what the old code already left on disk: a `.1` rotated at
+    // 0644 before this fix stays 0644 forever otherwise. An old conversation
+    // is not less private for predating the fix, and `.1` is where the bulk
+    // of it lives.
+    tightenIfLoose(`${path}.1`)
     rotateIfLarge(path, limit)
     // 0600: lines are redacted, but a log of a private chat is still private.
     appendFileSync(path, line, { mode: 0o600 })
