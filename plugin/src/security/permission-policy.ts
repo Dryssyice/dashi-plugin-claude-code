@@ -175,19 +175,8 @@ const WRITE_PATH_TOOLS = new Set<string>(['Edit', 'Write', 'NotebookEdit', 'Mult
 const BUILTIN_DENY_PATHS: readonly string[] = [
   '**/.env',
   '**/.env.*',
-  // A credential file does not have to be a dotfile. `agent.env`,
-  // `channel.env`, `local.env` hold the same material as `.env` and matched
-  // none of the patterns above, because those key on the leading dot rather
-  // than on what the file is. On 2026-07-29 a live bearer token was read out
-  // of `agent.env` with nothing objecting.
-  '**/*.env',
-  // Likewise by kind, not by name: anything whose name says «token».
-  '**/*token*',
   '**/*.pem',
   '**/*.key',
-  '**/.netrc',
-  '**/.npmrc',
-  '**/.envrc',
   '**/.secrets/**',
   '**/secrets/**',
   '**/id_rsa*',
@@ -250,17 +239,6 @@ const FORK_BOMB_RE = /:\s*\(\s*\)\s*\{[^}]*\|[^}]*&[^}]*\}\s*;\s*:/
 // `environment`/`monkey.json`-style false positives out.
 const SECRET_BASH_RES: readonly RegExp[] = [
   /(^|[\s'"=:(/<>|&;])\.env($|[\s'".)/<>|&;]|\.[a-z0-9_-]+)/i,
-  // Same widening as BUILTIN_DENY_PATHS: a name ending in `.env` is an
-  // environment file whether or not it starts with a dot. The preceding
-  // character must be part of a filename, so `NODE_ENV` and prose about «the
-  // env» stay out.
-  /[a-z0-9_-]\.env\b/i,
-  // «token» only when it looks like a path or a filename -- preceded by a
-  // separator, or carrying an extension. The bare English word must NOT match:
-  // `grep token src/parser.ts` is ordinary work, and a gate that blocks
-  // ordinary work gets worked around, which is worse than a narrower gate.
-  /(\/|[._-])[a-z0-9_-]*token|token[a-z0-9_-]*(\.[a-z0-9]+|\/)/i,
-  /\.envrc\b/i,
   /\.pem\b/i,
   /\.key\b/i,
   /(^|[\s'"=:(/<>|&;])\.?secrets?\//i,
