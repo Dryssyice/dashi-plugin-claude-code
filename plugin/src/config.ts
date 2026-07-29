@@ -164,7 +164,7 @@ export const AppConfigSchema = z.object({
     session_ttl_ms: z.number().int().positive().default(10 * 60 * 1000),
     collapse_completed_after: z.number().int().nonnegative().default(5),
   }).default({}),
-  // InboundWatcher (PR-A3, 2026-05-20) — auto-reply «Тралл занят» when the
+  // InboundWatcher (PR-A3, 2026-05-20) — auto-reply «Занят» when the
   // warchief sends plain text while a Claude session is mid-tool. Debounced
   // per chat (debounce_ms = 10s by default) so a burst of messages doesn't
   // bury the conversation in auto-acks. Busy threshold is the ProgressReporter
