@@ -101,8 +101,12 @@ function tightenIfLoose(path: string): void {
 function appendToFile(path: string, line: string, limit: number): void {
   try {
     mkdirSync(dirname(path), { recursive: true })
-    rotateIfLarge(path, limit)
+    // Tighten BEFORE rotating, not after. Rotation renames the current file to
+    // `.1`, and a rename carries the old permissions with it -- so tightening
+    // afterwards fixes only the empty file about to be created and leaves the
+    // whole rotated conversation world-readable.
     tightenIfLoose(path)
+    rotateIfLarge(path, limit)
     // 0600: lines are redacted, but a log of a private chat is still private.
     appendFileSync(path, line, { mode: 0o600 })
   } catch {

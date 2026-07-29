@@ -81,6 +81,20 @@ describe('logger file sink', () => {
     expect(statSync(path).size).toBeLessThan(400)
   })
 
+  test('the rotated copy is owner-only too', () => {
+    // Tightening only the current file leaves the rotated one carrying whatever
+    // permissions it had when it was still current. The old conversation is no
+    // less private for having been renamed, and `.1` is where most of it lives.
+    const path = join(dir, 'plugin.log')
+    writeFileSync(path, `${'x'.repeat(300)}\n`, { mode: 0o644 })
+    chmodSync(path, 0o644)
+
+    createLogger('status', { stream: sink(), filePath: path, rotateBytes: 200 }).info('rolls over')
+
+    expect(statSync(`${path}.1`).mode & 0o777).toBe(0o600)
+    expect(statSync(path).mode & 0o777).toBe(0o600)
+  })
+
   test('an unwritable path does not throw', () => {
     const path = join(dir, 'locked', 'plugin.log')
     writeFileSync(join(dir, 'locked'), 'not a directory')
