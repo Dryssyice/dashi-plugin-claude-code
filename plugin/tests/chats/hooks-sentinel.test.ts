@@ -171,6 +171,194 @@ describe('pre-tool-use.sh — multichat context with CHAT_ID', () => {
   })
 })
 
+describe('pre-tool-use.sh — the interpreter is chosen by checking, not by PATH', () => {
+  // The hook used to run `python3` from PATH on the assumption that the one
+  // PATH resolves has PyYAML. On this machine it did not, so the policy could
+  // not be parsed and the fail-safe denied EVERY Bash / Edit / Read call in
+  // every multichat session. The direction of the failure was right; the
+  // effect was an agent that looks broken rather than a missing package.
+  //
+  // These tests put a yaml-less python3 first on PATH on purpose. Installing
+  // PyYAML here would make them pass while fixing nothing — the next host
+  // resolves a third interpreter.
+
+  // A python3 that (a) reports no PyYAML and (b) makes it loud if the hook
+  // runs the policy through it anyway: exit 99 with a marker no policy path
+  // can produce.
+  const SHIM = [
+    '#!/usr/bin/env bash',
+    'if [ "$1" = "-c" ]; then',
+    '  case "$2" in *yaml*) exit 1;; esac',
+    'fi',
+    'printf \'%s\\n\' \'{"decision":"block","denied_by":"WRONG-INTERPRETER","reason":"the yaml-less shim ran the policy"}\'',
+    'exit 99',
+    '',
+  ].join('\n')
+
+  // Which interpreter the hook is SUPPOSED to fall back to is a property of the
+  // host, not of the test. Masking PATH without naming a known-good fallback
+  // would make these tests pass or fail depending on whether this machine keeps
+  // its PyYAML in /usr/bin or in a venv — and a host-dependent test proves
+  // nothing about the fix. So: probe once, pin it explicitly.
+  function findYamlPython(): string | null {
+    const probes = [
+      '/usr/bin/python3',
+      '/opt/homebrew/bin/python3',
+      '/usr/local/bin/python3',
+      spawnSync('bash', ['-c', 'command -v python3'], { encoding: 'utf8' })
+        .stdout?.trim() ?? '',
+    ]
+    for (const p of probes) {
+      if (!p) continue
+      const r = spawnSync(p, ['-c', 'import yaml'], { encoding: 'utf8' })
+      if (r.status === 0) return p
+    }
+    return null
+  }
+
+  const YAML_PYTHON = findYamlPython()
+  // No PyYAML anywhere on this host: the «policy is still evaluated» cases have
+  // nothing to evaluate it with. Skipped loudly rather than passed quietly.
+  const withYaml = YAML_PYTHON ? test : test.skip
+
+  let shimDir: string
+
+  beforeEach(() => {
+    shimDir = mkdtempSync(join(tmpdir(), 'yamlless-python-'))
+    const shim = join(shimDir, 'python3')
+    writeFileSync(shim, SHIM, { encoding: 'utf8', mode: 0o755 })
+  })
+
+  afterEach(() => {
+    rmSync(shimDir, { recursive: true, force: true })
+  })
+
+  function runWithShimFirst(
+    env: Record<string, string>,
+    stdin: string,
+  ): RunResult {
+    return run(PRE_HOOK, {
+      PATH: `${shimDir}:${process.env.PATH ?? '/usr/bin:/bin'}`,
+      CHATS_HOOK_PYTHON_FALLBACKS: YAML_PYTHON ?? '',
+      ...env,
+    }, stdin)
+  }
+
+  withYaml('PATH python3 without PyYAML -> policy is still evaluated (deny survives)', () => {
+    const r = runWithShimFirst(
+      {
+        MULTICHAT_STATE_DIR: workspace,
+        CLAUDE_WORKSPACE_DIR: workspace,
+        CHAT_ID: '164795011',
+      },
+      JSON.stringify({
+        tool_name: 'Bash',
+        tool_input: { command: 'sudo rm -rf / --no-preserve-root' },
+      }),
+    )
+    expect(r.code).toBe(2)
+    expect(r.stdout).toContain('bash_patterns deny')
+    expect(r.stdout).not.toContain('WRONG-INTERPRETER')
+  })
+
+  withYaml('PATH python3 without PyYAML -> an allowed call is still allowed', () => {
+    // The half that actually broke in production: not a deny that leaked, but
+    // every ordinary call denied because the policy could not be read.
+    const r = runWithShimFirst(
+      {
+        MULTICHAT_STATE_DIR: workspace,
+        CLAUDE_WORKSPACE_DIR: workspace,
+        CHAT_ID: '164795011',
+      },
+      JSON.stringify({ tool_name: 'Bash', tool_input: { command: 'ls -la' } }),
+    )
+    expect(r.code).toBe(0)
+    expect(r.stdout).toBe('')
+  })
+
+  withYaml('$CHATS_HOOK_PYTHON pointing at a yaml-less interpreter is skipped, not obeyed', () => {
+    // The pin is a preference, not an override of the one requirement.
+    const r = runWithShimFirst(
+      {
+        CHATS_HOOK_PYTHON: join(shimDir, 'python3'),
+        MULTICHAT_STATE_DIR: workspace,
+        CLAUDE_WORKSPACE_DIR: workspace,
+        CHAT_ID: '164795011',
+      },
+      JSON.stringify({ tool_name: 'Bash', tool_input: { command: 'ls -la' } }),
+    )
+    expect(r.code).toBe(0)
+  })
+
+  test('no interpreter with PyYAML anywhere -> deny, tagged hook-failure not policy', () => {
+    // Emptying the fallback list is the only way to reach this branch on a
+    // machine that has a working python somewhere. It must still deny — an
+    // unreadable policy is not an open door — but the caller has to be able to
+    // tell «the policy forbids this» from «I could not read the policy».
+    const r = runWithShimFirst(
+      {
+        CHATS_HOOK_PYTHON_FALLBACKS: '',
+        MULTICHAT_STATE_DIR: workspace,
+        CLAUDE_WORKSPACE_DIR: workspace,
+        CHAT_ID: '164795011',
+      },
+      JSON.stringify({ tool_name: 'Bash', tool_input: { command: 'ls -la' } }),
+    )
+    expect(r.code).toBe(2)
+    expect(r.stdout).toMatch(/"decision":\s*"block"/)
+    expect(r.stdout).toContain('hook-failure')
+    expect(r.stdout).toContain('no python3 with PyYAML found')
+  })
+})
+
+describe('pre-tool-use.sh — a block says which kind of block it is', () => {
+  test('a policy deny is tagged policy', () => {
+    const r = run(
+      PRE_HOOK,
+      {
+        MULTICHAT_STATE_DIR: workspace,
+        CLAUDE_WORKSPACE_DIR: workspace,
+        CHAT_ID: '164795011',
+      },
+      JSON.stringify({ tool_name: 'Bash', tool_input: { command: 'rm -rf /' } }),
+    )
+    expect(r.code).toBe(2)
+    expect(JSON.parse(r.stdout).denied_by).toBe('policy')
+  })
+
+  test('a missing policy file is tagged hook-failure', () => {
+    rmSync(policyPath, { force: true })
+    const r = run(
+      PRE_HOOK,
+      {
+        MULTICHAT_STATE_DIR: workspace,
+        CLAUDE_WORKSPACE_DIR: workspace,
+        CHAT_ID: '164795011',
+      },
+      JSON.stringify({ tool_name: 'Bash', tool_input: { command: 'ls' } }),
+    )
+    expect(r.code).toBe(2)
+    expect(JSON.parse(r.stdout).denied_by).toBe('hook-failure')
+  })
+
+  test('an unparseable policy is tagged hook-failure, not a policy verdict', () => {
+    writeFileSync(policyPath, 'chats: [unclosed\n', 'utf8')
+    const r = run(
+      PRE_HOOK,
+      {
+        MULTICHAT_STATE_DIR: workspace,
+        CLAUDE_WORKSPACE_DIR: workspace,
+        CHAT_ID: '164795011',
+      },
+      JSON.stringify({ tool_name: 'Bash', tool_input: { command: 'ls' } }),
+    )
+    expect(r.code).toBe(2)
+    const payload = JSON.parse(r.stdout)
+    expect(payload.denied_by).toBe('hook-failure')
+    expect(payload.reason).toContain('policy load failed')
+  })
+})
+
 describe('session-start.sh — sentinel pass-through', () => {
   test('MULTICHAT_STATE_DIR unset -> exit 0, no additionalContext emitted', () => {
     // Even if persona/policy exist, an unset MULTICHAT_STATE_DIR must

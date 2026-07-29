@@ -40,7 +40,7 @@ fi
 
 # Fail-safe: CHAT_ID missing -> full deny.
 if [[ -z "${CHAT_ID:-}" ]]; then
-  printf '%s\n' '{"decision":"block","reason":"CHAT_ID env var missing (fail-safe deny)"}'
+  printf '%s\n' '{"decision":"block","denied_by":"hook-failure","reason":"CHAT_ID env var missing (fail-safe deny)"}'
   exit 2
 fi
 
@@ -48,12 +48,52 @@ WORKSPACE="${CLAUDE_WORKSPACE_DIR:-${HOME}/.claude-lab/thrall/.claude}"
 POLICY_PATH="${WORKSPACE}/chats/policy.yaml"
 
 if [[ ! -f "$POLICY_PATH" ]]; then
-  printf '%s\n' '{"decision":"block","reason":"policy.yaml not found (fail-safe deny)"}'
+  printf '%s\n' '{"decision":"block","denied_by":"hook-failure","reason":"policy.yaml not found (fail-safe deny)"}'
   exit 2
 fi
 
-if ! command -v python3 >/dev/null 2>&1; then
-  printf '%s\n' '{"decision":"block","reason":"python3 unavailable (fail-safe deny)"}'
+# Pick an interpreter that can actually read the policy.
+#
+# This used to be `python3` from PATH, on the assumption that the one PATH
+# resolves has PyYAML. That assumption is not the hook's to make: Claude Code
+# invokes it from an environment the hook neither controls nor inspects. On this
+# machine PATH resolved to a Homebrew python WITHOUT PyYAML while /usr/bin had
+# it, so the policy could not be parsed at all and the fail-safe denied every
+# Bash, Edit and Read call in every multichat session. The direction of the
+# failure was right; the effect was an agent that looks broken rather than a
+# missing package.
+#
+# Installing PyYAML would fix this machine, not the defect -- the next host
+# resolves a third python. So: try candidates and keep the first whose `import
+# yaml` succeeds. Checking beats believing, and the check is the cheapest
+# possible form of the thing the hook is about to do anyway.
+#
+# $CHATS_HOOK_PYTHON first, so an operator can pin an interpreter without
+# editing this file. $CHATS_HOOK_PYTHON_FALLBACKS exists so the tests can empty
+# the well-known-paths list and reach the «found nothing» branch: a deny path
+# that cannot be provoked is a deny path nobody has ever seen run.
+CHATS_HOOK_PYTHON_FALLBACKS="${CHATS_HOOK_PYTHON_FALLBACKS-/usr/bin/python3 /opt/homebrew/bin/python3 /usr/local/bin/python3}"
+
+POLICY_PYTHON=""
+for candidate in \
+  "${CHATS_HOOK_PYTHON:-}" \
+  "$(command -v python3 2>/dev/null || true)" \
+  ${CHATS_HOOK_PYTHON_FALLBACKS}
+do
+  [[ -n "$candidate" ]] || continue
+  [[ -x "$candidate" ]] || continue
+  if "$candidate" -c 'import yaml' >/dev/null 2>&1; then
+    POLICY_PYTHON="$candidate"
+    break
+  fi
+done
+
+if [[ -z "$POLICY_PYTHON" ]]; then
+  # Still a deny -- an unreadable policy must not become an open door. But the
+  # reason now says which of the two things happened. «The policy forbids this»
+  # and «I could not read the policy» are different events with different fixes,
+  # and until now both arrived as an opaque block.
+  printf '%s\n' '{"decision":"block","denied_by":"hook-failure","reason":"no python3 with PyYAML found (tried $CHATS_HOOK_PYTHON, PATH, then $CHATS_HOOK_PYTHON_FALLBACKS) — the chat policy could not be read, so nothing was evaluated"}'
   exit 2
 fi
 
@@ -66,15 +106,24 @@ cat > "$TMP_INPUT"
 CHAT_ID="$CHAT_ID" \
 POLICY_PATH="$POLICY_PATH" \
 TMP_INPUT_PATH="$TMP_INPUT" \
-python3 - <<'PYEOF'
+"$POLICY_PYTHON" - <<'PYEOF'
 import fnmatch
 import json
 import os
 import sys
 
 
-def emit_block(reason: str) -> None:
-    print(json.dumps({'decision': 'block', 'reason': reason}))
+def emit_block(reason: str, denied_by: str = 'policy') -> None:
+    """Refuse the call, saying WHICH kind of refusal this is.
+
+    `denied_by` separates «the policy forbids this» from «the hook could not
+    evaluate the policy». Both must deny -- an unreadable policy is not an open
+    door -- but they are different events with different fixes, and until now
+    the caller saw one opaque block for both. A reader who cannot tell them
+    apart eventually treats every block as a policy decision and stops looking
+    for the broken install underneath.
+    """
+    print(json.dumps({'decision': 'block', 'denied_by': denied_by, 'reason': reason}))
     sys.exit(2)
 
 
@@ -86,18 +135,22 @@ try:
     with open(tmp_input_path, 'r', encoding='utf-8') as f:
         tool_call = json.load(f)
 except Exception as e:  # noqa: BLE001
-    emit_block(f'tool-call json unreadable: {e}')
+    emit_block(f'tool-call json unreadable: {e}', 'hook-failure')
 
 try:
     import yaml  # type: ignore
 except ImportError:
-    emit_block('PyYAML not installed (fail-safe deny)')
+    # The shell picked this interpreter BECAUSE `import yaml` worked in it, so
+    # reaching here means the environment changed between the check and the run.
+    # Kept as a guard rather than removed: the previous version of this hook
+    # died here on every call, and a guard that has fired once is worth keeping.
+    emit_block('PyYAML missing in the chosen interpreter (fail-safe deny)', 'hook-failure')
 
 try:
     with open(policy_path, 'r', encoding='utf-8') as f:
         policy = yaml.safe_load(f) or {}
 except Exception as e:  # noqa: BLE001
-    emit_block(f'policy load failed: {e}')
+    emit_block(f'policy load failed: {e}', 'hook-failure')
 
 chat_cfg = (policy.get('chats') or {}).get(chat_id) or {}
 deny = chat_cfg.get('deny') or {}
