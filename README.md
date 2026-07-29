@@ -607,7 +607,15 @@ TELEGRAM_STATE_DIR=/var/lib/dashi-channel/arthas
 TELEGRAM_WEBHOOK_HOST=127.0.0.1
 TELEGRAM_WEBHOOK_PORT=8090
 TELEGRAM_WEBHOOK_TOKEN=<random hex>
+DASHI_LOG_FILE=/var/log/dashi-channel/arthas.log
 ```
+
+`DASHI_LOG_FILE` is optional and mirrors every log line to that file in addition
+to stderr. Unset means stderr only, exactly as before. Set it when a command
+answers with silence and the host has already swallowed stderr — that is the
+case the file exists for. The file is created 0600 and rolled to `<path>.1` at
+5 MB; both copies are kept owner-only, and the logger refuses to write through
+a symlink or a fifo standing in for the path.
 
 And its own state config (`<state-dir>/config.json`):
 

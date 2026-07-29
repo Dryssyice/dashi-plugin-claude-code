@@ -7,10 +7,10 @@ import {
   constants,
   fchmodSync,
   fstatSync,
+  lstatSync,
   mkdirSync,
   openSync,
   renameSync,
-  statSync,
   writeSync,
 } from 'node:fs'
 import { dirname } from 'node:path'
@@ -88,7 +88,11 @@ function envLogFile(): string | undefined {
 
 function rotateIfLarge(path: string, limit: number): void {
   try {
-    if (statSync(path).size < limit) return
+    // lstat, not stat: the size that decides whether to rotate must come from
+    // the path itself, and a rename would move the link rather than any log.
+    const st = lstatSync(path)
+    if (!st.isFile()) return
+    if (st.size < limit) return
     renameSync(path, `${path}.1`)
   } catch {
     // Missing file is the normal first-write case; anything else must not
@@ -107,8 +111,14 @@ function tightenIfLoose(path: string): void {
     // the path: a log path someone can pre-create as a symlink would otherwise
     // have us chmod whatever it points at. Refusing to follow costs one log
     // line; following costs someone else's file.
-    fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW)
-    const mode = fstatSync(fd).mode & 0o777
+    // O_NONBLOCK before the type is known, not after: opening a fifo with no
+    // writer blocks in the open call itself, so a check that runs afterwards
+    // never runs at all. One mkfifo where the log is expected would otherwise
+    // freeze the whole plugin, not just the logger.
+    fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK)
+    const st = fstatSync(fd)
+    if (!st.isFile()) return
+    const mode = st.mode & 0o777
     if ((mode & 0o077) !== 0) fchmodSync(fd, 0o600)
   } catch {
     // Not there yet, or a symlink we decline to follow: the append below
@@ -153,7 +163,16 @@ function appendToFile(path: string, line: string, limit: number): void {
     if (!st.isFile()) return
     // 0600: lines are redacted, but a log of a private chat is still private.
     if ((st.mode & 0o077) !== 0) fchmodSync(fd, 0o600)
-    writeSync(fd, line)
+    // writeSync is allowed to write less than it was given. Ignoring the return
+    // value leaves a truncated line in the middle of the log, which is worse
+    // than a missing one: it reads as evidence of what happened.
+    const bytes = Buffer.from(line, 'utf8')
+    let written = 0
+    while (written < bytes.length) {
+      const n = writeSync(fd, bytes, written, bytes.length - written)
+      if (n <= 0) break
+      written += n
+    }
   } catch {
     // never let logging throw
   } finally {

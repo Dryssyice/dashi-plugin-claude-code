@@ -6,6 +6,7 @@
 // records, it does not leak, and it cannot take the server down.
 
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
+import { execFileSync } from 'node:child_process'
 import {
   chmodSync,
   mkdtempSync,
@@ -136,6 +137,32 @@ describe('logger file sink', () => {
 
     expect(statSync(victim).mode & 0o777).toBe(0o644)
     expect(readFileSync(victim, 'utf8')).toBe('not ours\n')
+  })
+
+  test('a fifo in place of the log does not hang the caller', () => {
+    // Opening a fifo with no writer blocks inside the open call, so a type
+    // check placed after it never runs. One mkfifo where the log is expected
+    // would freeze the plugin, not merely lose a line. The assertion is that
+    // this test returns at all -- bun kills a hung test rather than passing it.
+    const path = join(dir, 'plugin.log')
+    execFileSync('mkfifo', [path])
+
+    const log = createLogger('status', { stream: sink(), filePath: path })
+
+    expect(() => log.info('must not block')).not.toThrow()
+  })
+
+  test('a fifo in place of the rotated copy does not hang the caller', () => {
+    // `.1` is opened too, by the pass that repairs permissions an older version
+    // left behind, and it is the easier of the two to plant.
+    const path = join(dir, 'plugin.log')
+    writeFileSync(path, 'current\n', { mode: 0o600 })
+    execFileSync('mkfifo', [`${path}.1`])
+
+    const log = createLogger('status', { stream: sink(), filePath: path })
+
+    expect(() => log.info('must not block either')).not.toThrow()
+    expect(readFileSync(path, 'utf8')).toContain('must not block either')
   })
 
   test('an unwritable path does not throw', () => {
