@@ -17,3 +17,11 @@ coverage/
 ._*
 __pycache__/
 *.pyc
+
+# Runtime capture artifacts. Playwright writes page snapshots here while
+# driving a real session, so they contain whatever was on screen -- chat
+# content included. Same for a rendered board image left in the tree.
+.playwright-mcp/
+swarm-board.png
+# Written by the running session's own hooks (command log), not by the build.
+plugin/.claude/

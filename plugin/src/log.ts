@@ -2,6 +2,9 @@
 // Format: [ISO-ts] [level] [name] message {ctx-json}
 // Output goes to stderr by default so it doesn't poison the MCP stdio transport.
 
+import { appendFileSync, chmodSync, mkdirSync, renameSync, statSync } from 'node:fs'
+import { dirname } from 'node:path'
+
 import { redactToken } from './config.js'
 
 export type LogLevel = 'debug' | 'info' | 'warn' | 'error'
@@ -19,6 +22,13 @@ export interface CreateLoggerOptions {
   // (Telegram bot token, Groq key, Bearer/query tokens). Useful for the
   // configured TELEGRAM_WEBHOOK_TOKEN which has no public pattern.
   secrets?: ReadonlyArray<string>
+  // Mirror every emitted line into this file as well as the stream. Defaults
+  // to the DASHI_LOG_FILE environment variable; unset means stderr only, as
+  // before.
+  filePath?: string
+  // Size at which the file is rolled to `<path>.1`. Kept injectable so a test
+  // can prove rotation without writing megabytes.
+  rotateBytes?: number
 }
 
 const LEVEL_ORDER: Record<LogLevel, number> = {
@@ -55,17 +65,68 @@ function formatLine(
   return redactToken(body, secrets) + '\n'
 }
 
+// Stderr is the right default for an MCP stdio server, but it is also the
+// reason a misbehaving command cannot be diagnosed after the fact: the host
+// captures stderr, and by the time someone asks "why did /status say nothing?"
+// there is nothing left to read. Setting DASHI_LOG_FILE keeps a copy on disk.
+const ROTATE_BYTES = 5 * 1024 * 1024
+
+function envLogFile(): string | undefined {
+  const raw = (process.env.DASHI_LOG_FILE ?? '').trim()
+  return raw.length > 0 ? raw : undefined
+}
+
+function rotateIfLarge(path: string, limit: number): void {
+  try {
+    if (statSync(path).size < limit) return
+    renameSync(path, `${path}.1`)
+  } catch {
+    // Missing file is the normal first-write case; anything else must not
+    // take the logger down with it.
+  }
+}
+
+function tightenIfLoose(path: string): void {
+  try {
+    const mode = statSync(path).mode & 0o777
+    // `mode` on appendFileSync applies only when the file is created, so a log
+    // that already exists keeps whatever permissions it had -- including
+    // world-readable. Redaction removes tokens, not the conversation.
+    if ((mode & 0o077) !== 0) chmodSync(path, 0o600)
+  } catch {
+    // Not there yet: the append below creates it with the right mode.
+  }
+}
+
+function appendToFile(path: string, line: string, limit: number): void {
+  try {
+    mkdirSync(dirname(path), { recursive: true })
+    rotateIfLarge(path, limit)
+    tightenIfLoose(path)
+    // 0600: lines are redacted, but a log of a private chat is still private.
+    appendFileSync(path, line, { mode: 0o600 })
+  } catch {
+    // never let logging throw
+  }
+}
+
 export function createLogger(name: string, opts: CreateLoggerOptions = {}): Logger {
   const stream: NodeJS.WritableStream = opts.stream ?? process.stderr
   const threshold = LEVEL_ORDER[envLevel()]
   const secrets: ReadonlyArray<string> = opts.secrets ?? []
+  const filePath = opts.filePath ?? envLogFile()
+  const rotateBytes = opts.rotateBytes ?? ROTATE_BYTES
   const emit = (level: LogLevel, msg: string, ctx?: Record<string, unknown>): void => {
     if (LEVEL_ORDER[level] < threshold) return
+    const line = formatLine(name, level, msg, ctx, secrets)
     try {
-      stream.write(formatLine(name, level, msg, ctx, secrets))
+      stream.write(line)
     } catch {
       // never let logging throw
     }
+    // The file sink is written whether or not stderr accepted the line: the
+    // case worth diagnosing is precisely the one where the stream is gone.
+    if (filePath) appendToFile(filePath, line, rotateBytes)
   }
   return {
     debug: (msg, ctx) => emit('debug', msg, ctx),
