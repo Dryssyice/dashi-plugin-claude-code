@@ -120,18 +120,22 @@ describe('logger file sink', () => {
     expect(statSync(path).mode & 0o777).toBe(0o600)
   })
 
-  test('does not chmod through a symlink', () => {
+  test('writes nothing through a symlink', () => {
     // A log path an attacker can pre-create as a symlink must not turn the
-    // logger into a chmod primitive on someone else's file.
+    // logger into a chmod primitive on someone else's file -- and refusing the
+    // chmod while still appending is worse than either failure alone: the
+    // target keeps its permissions AND receives the private log. Both the mode
+    // and the contents have to be untouched.
     const victim = join(dir, 'victim.txt')
     writeFileSync(victim, 'not ours\n', { mode: 0o644 })
     chmodSync(victim, 0o644)
     const path = join(dir, 'plugin.log')
     symlinkSync(victim, path)
 
-    createLogger('status', { stream: sink(), filePath: path }).info('through a link')
+    createLogger('status', { stream: sink(), filePath: path }).info('PRIVATE_CHAT_MARKER')
 
     expect(statSync(victim).mode & 0o777).toBe(0o644)
+    expect(readFileSync(victim, 'utf8')).toBe('not ours\n')
   })
 
   test('an unwritable path does not throw', () => {

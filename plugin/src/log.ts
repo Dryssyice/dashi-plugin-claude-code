@@ -3,7 +3,6 @@
 // Output goes to stderr by default so it doesn't poison the MCP stdio transport.
 
 import {
-  appendFileSync,
   closeSync,
   constants,
   fchmodSync,
@@ -12,6 +11,7 @@ import {
   openSync,
   renameSync,
   statSync,
+  writeSync,
 } from 'node:fs'
 import { dirname } from 'node:path'
 
@@ -119,6 +119,7 @@ function tightenIfLoose(path: string): void {
 }
 
 function appendToFile(path: string, line: string, limit: number): void {
+  let fd: number | undefined
   try {
     mkdirSync(dirname(path), { recursive: true })
     // Tighten BEFORE rotating, not after. Rotation renames the current file to
@@ -133,10 +134,30 @@ function appendToFile(path: string, line: string, limit: number): void {
     // of it lives.
     tightenIfLoose(`${path}.1`)
     rotateIfLarge(path, limit)
+    // The write follows the same rule as the chmod above, and for a sharper
+    // reason: refusing to chmod through a symlink while still appending through
+    // it protects the target's permissions and hands it the private log anyway.
+    // O_NOFOLLOW makes the open fail on a link, O_CREAT|0600 covers the first
+    // write, and the fstat check keeps a fifo or device from standing in for a
+    // regular file. Losing a log line is the correct outcome here.
+    fd = openSync(
+      path,
+      constants.O_WRONLY |
+        constants.O_APPEND |
+        constants.O_CREAT |
+        constants.O_NOFOLLOW |
+        constants.O_NONBLOCK,
+      0o600,
+    )
+    const st = fstatSync(fd)
+    if (!st.isFile()) return
     // 0600: lines are redacted, but a log of a private chat is still private.
-    appendFileSync(path, line, { mode: 0o600 })
+    if ((st.mode & 0o077) !== 0) fchmodSync(fd, 0o600)
+    writeSync(fd, line)
   } catch {
     // never let logging throw
+  } finally {
+    if (fd !== undefined) closeSync(fd)
   }
 }
 
