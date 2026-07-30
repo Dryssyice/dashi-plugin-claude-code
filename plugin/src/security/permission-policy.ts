@@ -1829,6 +1829,642 @@ function bashConfirmEvasion(rawCommand: string): boolean {
   return bashEvasion(rawCommand, 0)
 }
 
+// ── built-in read-only Bash exception (owner 2026-07-29: "reading is always
+// silent") ───────────────────────────────────────────────────────────────
+//
+// `Bash` can never join READ_ONLY_TOOLS — a shell runs anything. But a plain
+// `git status --short` raising a Telegram card is the same failure as a `Read`
+// raising one, so instead of trusting the TOOL we prove the COMMAND: an
+// argv-checked allowlist of print-only programs, evaluated over the same
+// masked/tokenized view the pipe-to-interpreter detector uses.
+//
+// Deliberately NOT operator-configurable. The operator's own
+// `allow.bash_patterns` go through bashMatch(), which is UNANCHORED: an allow
+// pattern `git status` would also allow `git status && touch pwned`, and
+// operator allow returns before default_tier. This predicate instead requires
+// EVERY stage of EVERY pipeline to be a recognised read-only form.
+//
+// Placement (see classifyToolCall step 7): it sits beside the READ_ONLY_TOOLS
+// exception, so built-in hard deny, the secret/credential deny, operator deny,
+// every built-in confirm (pipe-to-interpreter, git exec surface, sudo/rm -rf/…)
+// and operator confirm ALL still win. It can only turn a `default_tier: confirm`
+// into an allow — it can never downgrade a deny or a confirm.
+//
+// WHY CHECKING EVERY STAGE IS ENOUGH: a second command can only hide inside a
+// stage (rather than becoming its own stage) via a construct that splitPipelines
+// deliberately skips over — `$(…)`, a backtick run, `(…)`, or a masked heredoc
+// body. Every one of those contains a character the metacharacter scan below
+// rejects outright, so if the scan passes, each stage's first word IS the whole
+// program that stage runs.
+//
+// FAIL CLOSED is the whole contract. Any construct we cannot fully model —
+// unbalanced quotes, a redirection, a substitution, an expansion, a wrapper, an
+// unknown program, a flag whose meaning we have not reviewed — returns false and
+// the command keeps carding. A false negative costs one card; a false positive
+// executes.
+
+/** Commands longer than this are not the `git status` case this exists for, and
+ *  a long line is where an unmodelled construct hides. */
+const READ_ONLY_BASH_MAX_LEN = 4096
+/** Pipelines/stages beyond this are likewise not the target case. */
+const READ_ONLY_BASH_MAX_STAGES = 32
+
+// Shell metacharacters that, OUTSIDE quotes, give a command reach beyond "read
+// and print": every redirection form (`>`, `>>`, `>|`, `<`, `<>`, `&>`, `2>`,
+// `n>&m`, here-docs/here-strings) contains `<` or `>`; `$` and a backtick open a
+// substitution or an expansion whose value we cannot resolve; `(`/`)` open a
+// subshell or a process substitution; `{`/`}` open a group, a function body or a
+// brace expansion. We reject the CHARACTER instead of modelling what it does.
+// Quoted occurrences are already blanked by maskQuotedLiterals, so a `>` that is
+// merely a grep PATTERN (`rg '>' src`) still reads as read-only.
+const READ_ONLY_FORBIDDEN_META_RE = /[<>`(){}$]/
+
+/** A `&` that is not part of `&&`: backgrounding (`ls &`) or an fd duplication
+ *  we do not model. splitPipelines treats a background `&` as a plain list
+ *  separator and drops it, so the stage loop alone cannot see it. */
+function hasBackgroundAmpersand(masked: string): boolean {
+  for (let i = 0; i < masked.length; i += 1) {
+    if (masked.charAt(i) !== '&') continue
+    if (masked.charAt(i + 1) === '&') { i += 1; continue } // `&&` list separator
+    return true
+  }
+  return false
+}
+
+/** Does a raw word carry a shell expansion we cannot resolve — `$…` or a
+ *  backtick outside single quotes? maskQuotedLiterals blanks the INSIDE of
+ *  double quotes, so the whole-command metacharacter scan above cannot see
+ *  `cat "$F"`; an unresolved value could name any file, including one the
+ *  secret-path deny only recognises by literal text. */
+function wordHasLiveExpansion(rawWord: string): boolean {
+  let quote: "'" | '"' | null = null
+  for (let i = 0; i < rawWord.length; i += 1) {
+    const ch = rawWord.charAt(i)
+    if (quote === "'") {
+      if (ch === "'") quote = null
+      continue
+    }
+    if (ch === '\\') { i += 1; continue } // `\$` is a literal dollar
+    if (quote === '"') {
+      if (ch === '"') { quote = null; continue }
+      if (ch === '$' || ch === '`') return true
+      continue
+    }
+    if (ch === "'" || ch === '"') { quote = ch; continue }
+    if (ch === '$' || ch === '`') return true
+  }
+  return false
+}
+
+/** Flags that disqualify a command from the read-only allowlist. */
+interface ReadOnlyRejectSpec {
+  /** Short-option LETTERS, matched case-sensitively ANYWHERE in a `-abc`
+   *  cluster (so `-Ff` is rejected for grep while `-F` alone is not). A letter
+   *  that is really an option VALUE (`sort -to`) over-rejects — safe side. */
+  readonly short?: string
+  /** Long-option NAMES without `--`; any `=value` tail is ignored. */
+  readonly long?: readonly string[]
+  /** Exact tokens — for `find`, whose primaries (`-delete`, `-exec`) are single
+   *  words, not option clusters. */
+  readonly exact?: readonly string[]
+}
+
+interface ReadOnlyCommandRule {
+  readonly reject?: ReadOnlyRejectSpec
+  /** Extra argv test when flag rejection alone cannot decide. */
+  readonly argvOk?: (args: readonly string[]) => boolean
+}
+
+function flagRejected(args: readonly string[], spec: ReadOnlyRejectSpec | undefined): boolean {
+  if (spec === undefined) return false
+  for (const a of args) {
+    if (spec.exact !== undefined && spec.exact.includes(a)) return true
+    if (a.startsWith('--')) {
+      const name = (a.slice(2).split('=')[0] ?? '')
+      if (spec.long !== undefined && spec.long.includes(name)) return true
+      continue
+    }
+    if (a.length > 1 && a.startsWith('-') && spec.short !== undefined) {
+      const cluster = a.slice(1).split('=')[0] ?? ''
+      const short = spec.short
+      if ([...cluster].some((c) => short.includes(c))) return true
+    }
+  }
+  return false
+}
+
+// ── git ─────────────────────────────────────────────────────────────────
+//
+// Subcommands whose only effect is to print repository state. `config` is
+// deliberately absent: `git config --get` reads credential helper paths and
+// `http.*.extraHeader` (i.e. secrets) and needs its own threat model.
+const GIT_READ_ONLY_SUBCOMMANDS = new Set([
+  'status', 'log', 'show', 'diff', 'rev-parse', 'ls-files', 'cat-file',
+  'describe', 'remote', 'branch',
+])
+
+// GLOBAL options (before the subcommand) are rejected wholesale except
+// `--no-pager`: `-c`/`--config-env` inject config that runs programs,
+// `--exec-path=` repoints git's binaries, and `-C`/`--git-dir`/`--work-tree`
+// aim the read at a different repository than the one the owner is looking at.
+// `--paginate` is NOT allowed either — it spawns a pager, which would hang a
+// non-interactive call.
+const GIT_ALLOWED_GLOBAL_FLAGS = new Set(['--no-pager'])
+
+// Long options that make a git READ write a file or run a program, anywhere in
+// argv: `--ext-diff`/`--textconv`/`--filters` run configured external programs,
+// `--output=` writes a file, `--pager=<cmd>` names a program, and the
+// exec/transport/config family is the surface gitExecSurface already models.
+// Matched by PREFIX because git resolves unambiguous long-option abbreviations
+// (`--ext` is `--ext-diff`), so we reject any name that is a prefix of one of
+// these — the reverse of an exact match, and the same trick
+// isAlwaysLongExecSurface uses.
+const GIT_DANGEROUS_LONG: readonly string[] = [
+  'ext-diff', 'textconv', 'filters', 'output', 'pager', 'exec', 'exec-path',
+  'upload-pack', 'receive-pack', 'config', 'config-env',
+]
+
+function gitLongOptionRejected(name: string): boolean {
+  if (name.length === 0) return false // bare `--` is end-of-options, e.g. `git diff -- src`
+  return GIT_DANGEROUS_LONG.some((d) => d.startsWith(name))
+}
+
+/** Split `git` argv into its subcommand and the rest, after checking the GLOBAL
+ *  options that precede the subcommand. `null` when a global option is not on
+ *  the tiny allowed list, or when there is no subcommand at all — shared by the
+ *  read-only and the reversible git paths so `git -C /other add -A` cannot be
+ *  silent just because `add` is. */
+function gitSplitGlobals(args: readonly string[]): { sub: string; rest: string[] } | null {
+  let i = 0
+  while (i < args.length && (args[i] as string).startsWith('-')) {
+    if (!GIT_ALLOWED_GLOBAL_FLAGS.has(args[i] as string)) return null
+    i += 1
+  }
+  const sub = args[i]
+  if (sub === undefined) return null
+  return { sub, rest: args.slice(i + 1) }
+}
+
+/** argv of a `git` invocation (tokens after the `git` word), dequoted. */
+function gitArgvIsReadOnly(args: readonly string[]): boolean {
+  const split = gitSplitGlobals(args)
+  if (split === null) return false
+  const { sub, rest } = split
+  if (!GIT_READ_ONLY_SUBCOMMANDS.has(sub)) return false
+  for (const a of rest) {
+    if (a.startsWith('--')) {
+      if (gitLongOptionRejected(a.slice(2).split('=')[0] ?? '')) return false
+      continue
+    }
+    // Short `-c` is git config injection in global position (rejected above) and
+    // harmless as a subcommand flag, but there is nothing to gain by telling
+    // them apart here — reject the cluster.
+    if (a.length > 1 && a.startsWith('-')) {
+      if ((a.slice(1).split('=')[0] ?? '').includes('c')) return false
+    }
+  }
+  if (sub === 'branch') {
+    // Almost every `git branch` form mutates: `-d`/`-D` delete, `-m`/`-M`
+    // rename, `--set-upstream-to` repoints, and a bare OPERAND creates a branch.
+    // The listing forms are the entire allowance.
+    const listing = rest.some((a) => a === '--list' || a === '-l')
+    if (rest.some((a) => a.startsWith('-') && a !== '--list' && a !== '-l')) return false
+    if (!listing && operands(rest).length > 0) return false
+  }
+  if (sub === 'remote') {
+    // `git remote -v` lists configured URLs locally. Operands turn it into
+    // `remote add`/`remove` (mutation) or `remote show` (network).
+    if (!rest.every((a) => a === '-v' || a === '--verbose')) return false
+  }
+  return true
+}
+
+// ── sed ─────────────────────────────────────────────────────────────────
+//
+// Only `sed -n <line-range>p` is accepted. A general sed program cannot be
+// checked robustly for write/exec commands (`w file`, `r file`, GNU `e`,
+// `s///w`) without parsing sed, so the allowance is narrowed to the one shape
+// whose safety is evident from the text: an optional line/range address followed
+// by `p`. Everything else — every `-e`, `-f`, `-i`, any other program — cards.
+const SED_PRINT_PROGRAM_RE = /^\s*[0-9]+(?:\s*,\s*(?:[0-9]+|\$))?\s*p\s*$/
+const SED_ALLOWED_FLAGS = new Set(['-n', '--quiet', '--silent'])
+
+function sedArgvIsReadOnly(args: readonly string[]): boolean {
+  if (!args.some((a) => a === '-n' || a === '--quiet' || a === '--silent')) return false
+  if (args.some((a) => a.startsWith('-') && a !== '--' && !SED_ALLOWED_FLAGS.has(a))) return false
+  const ops = operands(args)
+  const program = ops[0]
+  if (program === undefined) return false
+  return SED_PRINT_PROGRAM_RE.test(program)
+}
+
+// The allowlist. Anything absent cards — including `awk` (`system()`,
+// `print | cmd`, `getline < file`), broad `sed`, `jq` (`--rawfile`,
+// `--slurpfile`) and `git config`, each of which needs its own threat model.
+const READ_ONLY_BASH_COMMANDS = new Map<string, ReadOnlyCommandRule>([
+  ['git', { argvOk: gitArgvIsReadOnly }],
+  ['ls', {}],
+  ['pwd', {}],
+  ['basename', {}],
+  ['dirname', {}],
+  // `-f/--file` reads a list of dates FROM a file; `-s/--set` sets the system
+  // clock, which is a mutation the name does not suggest.
+  ['date', { reject: { short: 'fs', long: ['file', 'set'] } }],
+  ['whoami', {}],
+  ['uname', {}],
+  ['echo', {}],
+  ['printf', {}],
+  ['cat', {}],
+  ['head', {}],
+  // `-f/--follow` never returns; an auto-allowed call that blocks forever wedges
+  // the very session this exception exists to keep flowing.
+  ['tail', { reject: { short: 'f', long: ['follow'] } }],
+  ['wc', {}],
+  ['stat', {}],
+  // `file -C/--compile` WRITES a compiled magic file next to the magic source.
+  ['file', { reject: { short: 'C', long: ['compile'] } }],
+  ['cmp', {}],
+  ['diff', {}],
+  // `-f/--file` reads the pattern list from a file we have not policy-checked.
+  ['grep', { reject: { short: 'f', long: ['file'] } }],
+  // `--pre`/`--pre-glob` run a preprocessor program per file; `--hostname-bin`
+  // runs a binary to label hyperlinks; `-f/--file` reads the pattern list.
+  ['rg', { reject: { short: 'f', long: ['file', 'pre', 'pre-glob', 'hostname-bin'] } }],
+  ['find', {
+    reject: {
+      exact: [
+        '-delete', '-exec', '-execdir', '-ok', '-okdir',
+        '-fprint', '-fprint0', '-fprintf', '-fls',
+      ],
+    },
+  }],
+  ['sed', { argvOk: sedArgvIsReadOnly }],
+  // `-o/--output` writes a file; `--compress-program` runs a program.
+  ['sort', { reject: { short: 'o', long: ['output', 'compress-program'] } }],
+  // GNU `uniq [INPUT [OUTPUT]]` WRITES its second operand — no redirection
+  // needed — so a second operand disqualifies it.
+  ['uniq', { argvOk: (args) => operands(args).length <= 1 }],
+  ['cut', {}],
+  ['tr', {}],
+  ['column', {}],
+  ['test', {}],
+  ['[', {}],
+  // `which` prints where a name resolves on PATH; it opens nothing else and
+  // executes nothing. (`type` is left out: it is a shell builtin whose flags and
+  // output differ per shell, and `which` already covers the need.)
+  ['which', {}],
+])
+
+/** A bare command name — no `/`, so `./ls` and `/tmp/ls` (a local script that
+ *  merely borrows the name) are not read as the allowlisted program, and shell
+ *  keywords/operators (`{`, `!`, `if`) fail it too. */
+const READ_ONLY_HEAD_RE = /^[A-Za-z0-9_.[\]-]+$/
+
+/** A stage's dequoted words, or null when the stage cannot be modelled at all.
+ *  Shared by every silent-stage classifier so the wrapper/expansion/`VAR=x`
+ *  rejections are written once and cannot drift apart between them. */
+function silentStageWords(st: BashStage): string[] | null {
+  // tokenizeStage, NOT stageWords: stageWords deliberately strips `sudo`/`env`/
+  // `timeout`/`exec` wrappers to expose the interpreter underneath, which is
+  // exactly wrong here — `sudo ls` must never read as `ls`. Keeping the raw
+  // first word means every wrapper (and every `VAR=x` prefix) simply fails the
+  // allowlist lookup.
+  const toks = tokenizeStage(st)
+  if (toks.length === 0) return null
+  if (toks.some((t) => wordHasLiveExpansion(t.raw))) return null
+  const words = toks.map((t) => dequoteWord(t.raw))
+  const head = words[0] as string
+  // Both of these are redundant with the allowlist lookups below (an `=` or a
+  // `/` can never appear in an allowlist key), and are kept as explicit
+  // invariants: the rejection of `VAR=x cmd` and of a path-qualified head must
+  // not depend on how the allowlists happen to be keyed today.
+  if (ASSIGN_RE.test(head)) return null
+  if (!READ_ONLY_HEAD_RE.test(head)) return null
+  return words
+}
+
+function readOnlyStage(st: BashStage): boolean {
+  const words = silentStageWords(st)
+  if (words === null) return false
+  const rule = READ_ONLY_BASH_COMMANDS.get(words[0] as string)
+  if (rule === undefined) return false
+  const args = words.slice(1)
+  if (flagRejected(args, rule.reject)) return false
+  if (rule.argvOk !== undefined && !rule.argvOk(args)) return false
+  return true
+}
+
+// ── reversible Bash: index, commit, sandbox (owner 2026-07-31) ───────────
+//
+// "Reading, staging the index, committing, and working in the /tmp sandbox —
+// no cards. Cards stay on deleting data outside /tmp, publishing, money,
+// production, other people's machines, and secrets." Sixteen cards in two
+// hours on grep / git status / scratch scripts is the failure this closes.
+//
+// These three classes are NOT read-only — they write. They qualify because
+// each one is undoable with a single command and touches nothing the owner
+// keeps: the index is undone by `git reset`, a local commit by `git reset
+// --soft HEAD~1`, and everything under /tmp is scratch by definition.
+//
+// KNOWN AND ACCEPTED (owner's explicit call): allowing an interpreter to run a
+// file in the sandbox is ARBITRARY CODE EXECUTION. The script's own actions are
+// not checked by anything — for the sandbox class this gate is ADVISORY, not
+// preventive. It raises the cost of an accident, not of an attack. The path
+// checks below are still worth having (a mistyped `bash ~/deploy.sh` still
+// cards), but nobody should read them as containment.
+
+/** Sandbox roots, recomputed per call so a changed TMPDIR is honoured (and so a
+ *  test can exercise the TMPDIR branch without reloading the module).
+ *
+ *  macOS aliasing is the trap: `/tmp` IS `/private/tmp` and `/var/folders/…`
+ *  IS `/private/var/folders/…` — the same directory under two spellings, and a
+ *  literal comparison would card half of the real paths. We add the alias for
+ *  each root explicitly rather than stripping a leading `/private` from
+ *  arbitrary operands, which would also bless a genuinely different
+ *  `/private/...` directory on Linux. */
+function sandboxRoots(): string[] {
+  const declared = ['/tmp', '/private/tmp']
+  const tmpdir = process.env.TMPDIR
+  // A relative TMPDIR means a directory we cannot locate without a cwd, and
+  // `/` would widen the sandbox to the whole disk — ignore both.
+  if (typeof tmpdir === 'string' && tmpdir.startsWith('/') && !tmpdir.includes('..')) {
+    declared.push(tmpdir)
+  }
+  const roots: string[] = []
+  for (const d of declared) {
+    const norm = normalizeAbsPath(d)
+    if (norm === null || norm === '/') continue
+    roots.push(norm)
+    roots.push(norm.startsWith('/private/') ? norm.slice('/private'.length) : `/private${norm}`)
+  }
+  return roots
+}
+
+/** Lexically normalise an absolute path: collapse repeated slashes, drop `.`
+ *  segments, strip the trailing slash. Returns null for a relative path or one
+ *  containing `..` — a traversal is REJECTED, never resolved, because resolving
+ *  it correctly needs the filesystem (symlinks) and a wrong resolution is the
+ *  whole escape. */
+function normalizeAbsPath(p: string): string | null {
+  if (!p.startsWith('/')) return null
+  const segs: string[] = []
+  for (const s of p.split('/')) {
+    if (s === '' || s === '.') continue
+    if (s === '..') return null
+    segs.push(s)
+  }
+  return `/${segs.join('/')}`
+}
+
+/** Is this word a path STRICTLY inside a sandbox root? The root itself is not
+ *  inside it: `rm -r /tmp` wipes every other session's scratch, which is the
+ *  data loss cards exist for. A glob (`/tmp/*`) is fine — the shell can only
+ *  expand it to entries that are themselves under the root. */
+function isSandboxPath(word: string): boolean {
+  const norm = normalizeAbsPath(word)
+  if (norm === null) return false
+  return sandboxRoots().some((r) => norm.startsWith(`${r}/`))
+}
+
+/** Per-command flag allowlist for the sandbox class. Anything not listed cards:
+ *  a flag we have not read the man page for is a flag we cannot vouch for. */
+interface SandboxRule {
+  /** Short-option letters allowed in a cluster. */
+  readonly short: string
+  /** Long-option names allowed (without `--`, and only in the valueless form). */
+  readonly long: readonly string[]
+  /** Fewest path operands the command needs to be meaningful. */
+  readonly minPaths: number
+  /** `chmod`'s first operand is a MODE, not a path. */
+  readonly firstOperandIsMode?: boolean
+}
+
+// `-R` is deliberately absent from `chmod` and `-rf` cannot be reached on `rm`:
+// `rm -rf `/`rm -fr `/`chmod -r` are BUILTIN_CONFIRM_BASH entries that fire at
+// step 4, two steps before this one. Listing them here would put the written
+// rule and the running mechanism in disagreement, which is worse than either.
+const SANDBOX_COMMANDS = new Map<string, SandboxRule>([
+  ['mkdir', { short: 'pv', long: ['parents', 'verbose'], minPaths: 1 }],
+  // `-r`/`-d`/`-t` take a reference file or a timestamp value we would have to
+  // model; `-acm` only pick which timestamp to bump.
+  ['touch', { short: 'acm', long: [], minPaths: 1 }],
+  ['cp', { short: 'rRpvnf', long: ['recursive', 'verbose', 'no-clobber', 'force'], minPaths: 2 }],
+  ['mv', { short: 'vnf', long: ['verbose', 'no-clobber', 'force'], minPaths: 2 }],
+  ['rm', { short: 'rRfvd', long: ['recursive', 'force', 'verbose', 'dir'], minPaths: 1 }],
+  ['chmod', { short: 'vf', long: ['verbose'], minPaths: 1, firstOperandIsMode: true }],
+  // The interpreters take NO flags — the empty `short`/`long` is what forbids
+  // `-c`/`-e`/`-m`, each of which supplies a program with no path to check.
+  // Widening either list for an interpreter re-opens inline code execution.
+  ['bash', { short: '', long: [], minPaths: 1 }],
+  ['sh', { short: '', long: [], minPaths: 1 }],
+  ['python3', { short: '', long: [], minPaths: 1 }],
+  ['node', { short: '', long: [], minPaths: 1 }],
+])
+
+/** An octal (`755`, `0644`) or symbolic (`+x`, `u=rw,go=r`) chmod mode. A
+ *  symbolic mode written as `-x` is indistinguishable from a flag and cards. */
+const CHMOD_MODE_RE = /^(?:[0-7]{3,4}|[ugoa]*[+-=][rwxXstugo]*(?:,[ugoa]*[+-=][rwxXstugo]*)*)$/
+
+function sandboxArgvOk(args: readonly string[], rule: SandboxRule): boolean {
+  const paths: string[] = []
+  let endOpts = false
+  for (const a of args) {
+    if (!endOpts && a === '--') { endOpts = true; continue }
+    // A lone `-` names stdin, not a path — it falls through to the path check
+    // and is rejected there.
+    if (!endOpts && a.length > 1 && a.startsWith('-')) {
+      if (a.startsWith('--')) {
+        // `--flag=value` carries a value we have not modelled; only the bare
+        // form is allowed.
+        if (a.includes('=')) return false
+        if (!rule.long.includes(a.slice(2))) return false
+        continue
+      }
+      const cluster = a.slice(1)
+      if (![...cluster].every((c) => rule.short.includes(c))) return false
+      continue
+    }
+    paths.push(a)
+  }
+  let rest = paths
+  if (rule.firstOperandIsMode === true) {
+    const mode = paths[0]
+    if (mode === undefined || !CHMOD_MODE_RE.test(mode)) return false
+    rest = paths.slice(1)
+  }
+  if (rest.length < rule.minPaths) return false
+  return rest.every((p) => isSandboxPath(p))
+}
+
+// ── git add: the index is undone by one `git reset` ─────────────────────
+//
+// Pathspec operands are NOT restricted to the sandbox: `git add` can only touch
+// paths inside the repository it runs in, and whatever it stages is undone by
+// `git reset` without losing a byte of working-tree content.
+const GIT_ADD_INTERACTIVE = {
+  // `-i`/`-p` open a full-screen prompt and `-e` opens $EDITOR; all three wait
+  // for keystrokes that cannot arrive over Telegram, so an auto-allowed call
+  // would hang the very session this exception exists to keep flowing.
+  short: 'ipe',
+  long: ['interactive', 'patch', 'edit'],
+} as const
+
+// ── git commit: allowlisted flags only ──────────────────────────────────
+//
+// NOT allowed, each for its own reason: `--amend` rewrites history (forbidden
+// by the operator's git rules); `--no-verify`/`-n` skip the hooks, i.e. skip
+// the protection itself; `--author`/`--date` forge provenance; `-F`/`-C` take
+// the message from a file or another commit we never read.
+const GIT_COMMIT_LONG_ALLOWED = new Set(['message', 'all', 'allow-empty', 'quiet'])
+const GIT_COMMIT_SHORT_ALLOWED = 'aq'
+
+function gitCommitArgvIsSilent(rest: readonly string[]): boolean {
+  let sawMessage = false
+  for (let i = 0; i < rest.length; i += 1) {
+    const a = rest[i] as string
+    if (a.startsWith('--')) {
+      const eq = a.indexOf('=')
+      const name = eq === -1 ? a.slice(2) : a.slice(2, eq)
+      if (!GIT_COMMIT_LONG_ALLOWED.has(name)) return false
+      if (name === 'message') {
+        sawMessage = true
+        // `--message=<msg>` carries its value inline; `--message <msg>` eats the
+        // next word, which must not then be read as an unexpected operand.
+        if (eq === -1) {
+          if (i + 1 >= rest.length) return false
+          i += 1
+        }
+        continue
+      }
+      // Every other allowed long option is a boolean; a `=value` on it is a
+      // form we have not modelled.
+      if (eq !== -1) return false
+      continue
+    }
+    if (a.startsWith('-') && a.length > 1) {
+      const cluster = a.slice(1)
+      let consumed = false
+      for (let j = 0; j < cluster.length; j += 1) {
+        const ch = cluster.charAt(j)
+        if (ch === 'm') {
+          sawMessage = true
+          // `-mfoo` attaches the message; a trailing `-m` takes the next word.
+          if (j === cluster.length - 1) {
+            if (i + 1 >= rest.length) return false
+            i += 1
+          }
+          consumed = true
+          break
+        }
+        if (!GIT_COMMIT_SHORT_ALLOWED.includes(ch)) return false
+      }
+      if (consumed) continue
+      continue
+    }
+    // A bare operand is a pathspec: a partial commit of files nobody checked.
+    return false
+  }
+  // Without `-m` git opens $EDITOR and the call never returns — the same hang
+  // that disqualifies `git add -p`.
+  return sawMessage
+}
+
+/** argv of a `git` invocation that WRITES but is undoable by one command. */
+function gitArgvIsReversible(args: readonly string[]): boolean {
+  const split = gitSplitGlobals(args)
+  if (split === null) return false
+  const { sub, rest } = split
+  for (const a of rest) {
+    if (a.startsWith('--')) {
+      if (gitLongOptionRejected(a.slice(2).split('=')[0] ?? '')) return false
+      continue
+    }
+    // `-c` in global position is config injection (already rejected by
+    // gitSplitGlobals); after the subcommand it is rejected wholesale for the
+    // same reason the read-only path does it — a simpler proof beats one card.
+    if (a.length > 1 && a.startsWith('-') && (a.slice(1).split('=')[0] ?? '').includes('c')) return false
+  }
+  if (sub === 'add') {
+    return rest.length > 0 && !flagRejected(rest, GIT_ADD_INTERACTIVE)
+  }
+  if (sub === 'commit') return gitCommitArgvIsSilent(rest)
+  return false
+}
+
+/** How a single stage qualifies for step 7b, or null if it does not. */
+type SilentStageKind = 'read-only' | 'reversible'
+
+function silentStage(st: BashStage): SilentStageKind | null {
+  if (readOnlyStage(st)) return 'read-only'
+  const words = silentStageWords(st)
+  if (words === null) return null
+  const head = words[0] as string
+  const args = words.slice(1)
+  if (head === 'git') return gitArgvIsReversible(args) ? 'reversible' : null
+  const sandbox = SANDBOX_COMMANDS.get(head)
+  if (sandbox !== undefined) return sandboxArgvOk(args, sandbox) ? 'reversible' : null
+  return null
+}
+
+/**
+ * The strongest claim we can prove about a Bash command for step 7b:
+ * `'read-only'` when every stage only prints, `'reversible'` when every stage
+ * is read-only OR one of the undoable writes (index, commit, sandbox), and
+ * null when anything at all is unmodelled. Built-in and NOT operator
+ * configurable; see the block comments above for the precedence it sits in and
+ * the fail-closed contract.
+ */
+function silentBashKind(command: string): SilentStageKind | null {
+  if (typeof command !== 'string') return null
+  const trimmed = command.trim()
+  if (trimmed.length === 0 || trimmed.length > READ_ONLY_BASH_MAX_LEN) return null
+  // bash joins `\<newline>` before word splitting, so a flag split across lines
+  // (`git -\<nl>c …`) is really one token — join first for the same reason
+  // gitExecSurface does.
+  const joined = stripLineContinuations(command)
+  // Reuse the git exec-surface knowledge rather than re-deriving it: this covers
+  // `GIT_EXTERNAL_DIFF=`/`GIT_SSH_COMMAND=` env indirection, `git -c <cfg>`,
+  // `--config-env`, `--upload-pack` and `.git/hooks` writes. Step 4 of
+  // classifyToolCall already confirms on all of it; checking here keeps the
+  // predicate honest standing alone.
+  if (gitExecSurface(joined)) return null
+  // Same reason: the secret/credential deny is a hard deny two steps above, so
+  // this is unreachable through classifyToolCall — but the predicate is exported
+  // and must not answer "read-only: yes" about `cat .env` to any future caller.
+  if (bashReferencesSecret(joined)) return null
+  const masked = maskQuotedLiterals(maskHeredocBodies(joined))
+  if (masked === null) return null // unbalanced quotes → cannot model → card
+  if (READ_ONLY_FORBIDDEN_META_RE.test(masked)) return null
+  if (hasBackgroundAmpersand(masked)) return null
+  let stages = 0
+  let kind: SilentStageKind = 'read-only'
+  for (const pipeline of splitPipelines(joined, masked)) {
+    for (const st of pipeline) {
+      stages += 1
+      if (stages > READ_ONLY_BASH_MAX_STAGES) return null
+      const st_kind = silentStage(st)
+      if (st_kind === null) return null
+      // The weakest stage sets the verdict for the whole command.
+      if (st_kind === 'reversible') kind = 'reversible'
+    }
+  }
+  // No stage at all means the tokenizers disagreed with us about there being a
+  // command — fail closed rather than allow an empty verdict.
+  return stages > 0 ? kind : null
+}
+
+/** Is this Bash command provably read-only — every stage of every pipeline a
+ *  print-only program with argv we have checked? */
+export function isReadOnlyBashCommand(command: string): boolean {
+  return silentBashKind(command) === 'read-only'
+}
+
+/** Is this Bash command provably silent — read-only, or a write that one
+ *  command undoes (git index, local commit, /tmp sandbox)? */
+export function isSilentBashCommand(command: string): boolean {
+  return silentBashKind(command) !== null
+}
+
 /**
  * Minimal glob matcher supporting `*`, `?`, and `**`.
  *   * `**` matches across path separators (any chars incl. `/`).
@@ -2045,7 +2681,8 @@ export interface ClassifyInput {
  *   4. Built-in confirm bash (interpreter/exfil/destructive) — UNCONDITIONAL.
  *   5. Operator confirm.
  *   6. Operator allow.
- *   7. default_tier (read-only tools always allow).
+ *   7. default_tier (read-only tools, and Bash commands proven read-only by
+ *      isReadOnlyBashCommand, always allow).
  */
 export function classifyToolCall(input: ClassifyInput): PermissionVerdict {
   const { toolName, toolInput, policy, scope } = input
@@ -2163,6 +2800,30 @@ export function classifyToolCall(input: ClassifyInput): PermissionVerdict {
   // 7. Default. Read-only tools always auto-allow.
   if (READ_ONLY_TOOLS.has(toolName)) {
     return { tier: 'allow', reason: 'read-only tool', matchedRule: 'builtin:read_only' }
+  }
+  // 7b. A Bash command PROVEN read-only auto-allows here, for the same reason
+  // READ_ONLY_TOOLS does — reading must never card the owner. So does a write
+  // proven undoable by one command (git index, local commit, /tmp sandbox):
+  // owner 2026-07-31, after 16 cards in two hours. Built-in, not
+  // operator-configurable, and placed at the same point in the precedence, so
+  // every deny and every confirm above still wins over it — `rm -rf /tmp/x`
+  // and `chmod -R 755 /tmp/x` keep carding at step 4.
+  if (rawCommand !== undefined) {
+    const silent = silentBashKind(rawCommand)
+    if (silent === 'read-only') {
+      return {
+        tier: 'allow',
+        reason: 'read-only bash command',
+        matchedRule: 'builtin:read_only_bash',
+      }
+    }
+    if (silent === 'reversible') {
+      return {
+        tier: 'allow',
+        reason: 'reversible bash command (index / local commit / tmp sandbox)',
+        matchedRule: 'builtin:silent_bash',
+      }
+    }
   }
   const def: PermissionTier = policy.default_tier === 'allow' ? 'allow' : 'confirm'
   return {

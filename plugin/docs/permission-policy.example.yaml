@@ -22,7 +22,43 @@
 version: 1
 
 # Unmatched mutating tools run silently. Read-only tools (Read/Grep/Glob/...)
-# always auto-allow. Set to `confirm` for Variant 2 (tap to approve every edit).
+# always auto-allow, and so does a Bash command PROVEN read-only by the built-in
+# check (`git status`, `ls`, `cat`, `rg`, `find` without -exec/-delete, …): every
+# stage of every pipeline must be an allowlisted print-only program with checked
+# argv, and any redirection, substitution, wrapper or unknown program disables
+# it. That check is built in and NOT configurable here — do not try to reproduce
+# it with `allow.bash_patterns`, which are substring matches: an allow pattern
+# `git status` would also allow `git status && touch pwned`.
+#
+# Three REVERSIBLE write classes auto-allow on the same terms, because each is
+# undone by a single command and touches nothing you keep:
+#   * `git add` — the index; undone by `git reset`. Interactive forms (`-i`,
+#     `-p`, `-e`) still card: they wait for keystrokes and would hang.
+#   * `git commit` with an explicit `-m`/`--message`, plus `-a`, `--allow-empty`
+#     and `-q`. Everything else cards — `--amend` (rewrites history),
+#     `--no-verify`/`-n` (skips the hooks, i.e. skips the protection),
+#     `--author`/`--date` (forges provenance), `-F`/`-C`, and a bare
+#     `git commit` (opens $EDITOR and never returns).
+#   * The /tmp SANDBOX — `mkdir`, `touch`, `cp`, `mv`, `rm`, `chmod`, and
+#     running a file with `bash`/`sh`/`python3`/`node`, but ONLY when EVERY
+#     path in the command is strictly inside `/tmp`, `/private/tmp` or `$TMPDIR`
+#     (the two macOS spellings of the same directory are treated as equal). A
+#     relative path, a `..` segment, or one path outside those roots cards the
+#     whole command; so does the root itself (`rm -r /tmp`).
+#
+# READ THIS BEFORE RELYING ON THE SANDBOX CLASS: allowing an interpreter to run
+# a file in /tmp is ARBITRARY CODE EXECUTION. Nothing checks what the script
+# does — it can write anywhere, and a symlink inside /tmp can point outside it.
+# For the sandbox class this gate is ADVISORY, not preventive: it raises the
+# cost of a typo, not of an attack. That is a deliberate owner decision
+# (2026-07-31), taken because 16 confirmation cards in two hours on grep,
+# `git status` and scratch scripts cost more than they bought.
+#
+# Cards remain on everything the classes above do not cover: deleting or
+# writing outside the sandbox, publishing, money, production, other machines
+# (`ssh`/`scp`/`rsync`), and secrets. `rm -rf …` and `chmod -R …` still card
+# even inside /tmp — they are built-in confirms that fire before this step.
+# Set to `confirm` for Variant 2 (tap to approve every edit).
 default_tier: allow
 
 # Operator confirm — risky-but-legitimate operations you want to wave through
