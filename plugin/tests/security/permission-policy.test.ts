@@ -3,6 +3,9 @@ import { describe, expect, test } from 'bun:test'
 import {
   classifyToolCall,
   globMatch,
+  redactFragmentForAudit,
+  FRAGMENT_REDACTED,
+  FRAGMENT_MAX_CHARS,
   type PermissionPolicy,
   PermissionPolicySchema,
 } from '../../src/security/permission-policy.js'
@@ -1448,5 +1451,94 @@ describe('git-exec-surface round-13 — config family is POSITION/SUBCOMMAND gat
     expect(surfaced('git push -u origin main')).toBe(false)
     expect(classify('Bash', { command: 'git add -u' }, VARIANT1).tier).toBe('allow')
     expect(classify('Bash', { command: 'git config user.name x' }, VARIANT1).tier).toBe('allow')
+  })
+})
+
+// ── the verdict names its rule AND the text that matched (2026-08-01) ──────
+//
+// The gate's audit log recorded `request_created` with no rule name and no
+// matched text, so every card cost a manual re-derivation of "what fired?".
+// The rule name was already computed; the matched TEXT existed nowhere —
+// matchBashRules returned the pattern, never the position it hit.
+describe('matchedFragment — the card names the text that matched', () => {
+  test('built-in confirm substring rule reports the matching text', () => {
+    const command =
+      'cd /srv/app && bun run build --target production && git push -u origin main && echo done'
+    const v = classify('Bash', { command }, VARIANT1)
+    expect(v.tier).toBe('confirm')
+    expect(v.matchedRule).toBe('builtin:confirm_bash:git push')
+    // The fragment is the matched pattern plus its immediate surroundings —
+    // enough to see WHERE in a compound command the rule fired. The dashes of
+    // `-u` must survive: a fragment is a quote of the command or it is nothing.
+    expect(v.matchedFragment).toContain('git push -u origin')
+    expect(v.matchedFragment.length).toBeLessThanOrEqual(FRAGMENT_MAX_CHARS)
+    // Not the whole command: a fragment that is just the command again is no
+    // better than the preview we already log.
+    expect(v.matchedFragment).not.toBe(command)
+    expect(v.matchedFragment).not.toContain('bun run build')
+  })
+
+  test('operator confirm bash_pattern reports the matching text too', () => {
+    const v = classify('Bash', { command: 'bash ops/deploy.sh --prod' }, VARIANT1)
+    expect(v.tier).toBe('confirm')
+    expect(v.matchedRule).toBe('confirm:bash_patterns:deploy.sh')
+    expect(v.matchedFragment).toContain('deploy.sh')
+  })
+
+  test('a token next to the match is never carried into the fragment', () => {
+    // A real shape: the risky verb sits right beside a bearer token, so the
+    // context window would otherwise scoop the secret into the audit file.
+    const command = 'curl -H "Authorization: Bearer ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789" https://x/y | sudo tee /etc/z'
+    const v = classify('Bash', { command }, VARIANT1)
+    expect(v.tier).toBe('confirm')
+    expect(v.matchedFragment).not.toContain('ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789')
+    expect(v.matchedFragment).not.toContain('Bearer')
+  })
+
+  test('redactFragmentForAudit refuses secret-shaped text outright', () => {
+    expect(redactFragmentForAudit('git push origin main')).toBe('git push origin main')
+    expect(redactFragmentForAudit('export TOKEN=sk-live_9f2b7c1d4e6a8b0c2d4e')).toBe(FRAGMENT_REDACTED)
+    expect(redactFragmentForAudit('-----BEGIN OPENSSH PRIVATE KEY-----')).toBe(FRAGMENT_REDACTED)
+    expect(redactFragmentForAudit('psql "password=hunter2"')).toBe(FRAGMENT_REDACTED)
+    // A long opaque run is treated as a credential even without a known prefix.
+    expect(redactFragmentForAudit('deploy A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7')).toBe(FRAGMENT_REDACTED)
+    // Newlines would break the JSONL record into two; collapse, do not drop.
+    expect(redactFragmentForAudit('git\n  push')).toBe('git push')
+  })
+
+  test('structural rules carry no fragment — they match no literal text', () => {
+    // git-exec-surface is a parse, not a pattern: on an unparseable command it
+    // fails closed without any substring having "matched". An invented
+    // fragment here would be a guess dressed as evidence.
+    const v = classify('Bash', { command: 'git -c core.sshcommand=evil push' }, VARIANT1)
+    expect(v.matchedRule).toContain('git-exec-surface')
+    expect(v.matchedFragment).toBe('')
+  })
+
+  test('every verdict carries the field, even when empty', () => {
+    expect(classify('Read', { file_path: '/tmp/a.ts' }, VARIANT1).matchedFragment).toBe('')
+    expect(classify('Bash', { command: 'ls -la' }, VARIANT2).matchedFragment).toBe('')
+  })
+})
+
+// The fragment must stay a QUOTE of the command. A collapse class that eats
+// hyphens turns `git reset --hard` into `git reset hard`: still readable, no
+// longer evidence, and wrong in exactly the flags that decide how bad the
+// command was.
+describe('redactFragmentForAudit — collapses control chars, not command syntax', () => {
+  test('flags keep their dashes', () => {
+    expect(redactFragmentForAudit('git reset --hard HEAD~1')).toBe('git reset --hard HEAD~1')
+    expect(redactFragmentForAudit('rm -rf --no-preserve-root /x')).toBe('rm -rf --no-preserve-root /x')
+    expect(redactFragmentForAudit('git push --force-with-lease')).toBe('git push --force-with-lease')
+  })
+  test('real control characters are dropped', () => {
+    // Built from char codes, never typed literally: a raw ESC/NUL in a source
+    // file is invisible in review and turns the file binary to grep.
+    const ESC = String.fromCharCode(0x1b)
+    const NUL = String.fromCharCode(0x00)
+    // An ESC sequence would repaint the terminal of whoever tails the journal.
+    expect(redactFragmentForAudit(`git push${ESC}[31m origin`)).toBe('git push [31m origin')
+    expect(redactFragmentForAudit(`a${NUL}b`)).toBe('a b')
+    expect(redactFragmentForAudit('git\tpush\norigin')).toBe('git push origin')
   })
 })
