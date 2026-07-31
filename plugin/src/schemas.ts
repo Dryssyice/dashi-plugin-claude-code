@@ -87,6 +87,13 @@ export const PermissionRequestRouteSchema = z.object({
   tool_name: z.string().min(1).max(256),
   preview: z.string().max(4096).default(''),
   reason: z.string().max(1024).default(''),
+  // Audit fields (2026-08-01). Optional with a default so an older hook binary
+  // keeps working — a missing rule name must not fail-closed the whole call.
+  // The bounds are small on purpose: the fragment is a quote of the matching
+  // text, not a second copy of the command (which `preview` already carries).
+  matched_rule: z.string().max(256).default(''),
+  matched_fragment: z.string().max(256).default(''),
+  cwd: z.string().max(4096).default(''),
   timeout_ms: z.number().int().positive().optional(),
 })
 export type PermissionRequestRoute = z.infer<typeof PermissionRequestRouteSchema>

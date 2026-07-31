@@ -10,6 +10,7 @@ import type { StatePaths } from '../../config.js'
 import { resolvePermissionGateAllowedUserIds } from '../../config.js'
 import type { Logger } from '../../log.js'
 import { PermissionRequestRouteSchema, type PermissionRequestRoute } from '../../schemas.js'
+import { redactFragmentForAudit } from '../../security/permission-policy.js'
 import type { WebhookDeps } from '../server.js'
 import { authGate, readJsonBody, reply } from './shared.js'
 
@@ -134,6 +135,18 @@ export async function handlePermissionRequest(
       session_id: payload.session_id,
       tool_name: payload.tool_name,
       chat_id: chatId,
+      // Which rule raised the card, and the text it matched. Without these the
+      // record said only "a card appeared", and the rule had to be re-derived
+      // by hand every time (six days of it, 2026-08-01).
+      matched_rule: payload.matched_rule,
+      // Redacted HERE as well as in the hook: this function is what writes the
+      // file, so the "no secret in the journal" guarantee has to hold at the
+      // write, not only at the sender we happen to trust today.
+      matched_fragment: redactFragmentForAudit(payload.matched_fragment),
+      // The working directory of the call: two worktrees of one repository
+      // produce byte-identical git author/committer, so the object alone cannot
+      // say which tree acted.
+      cwd: payload.cwd,
       timeout_ms: effectiveTimeoutMs,
     })
     try {

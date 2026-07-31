@@ -171,3 +171,63 @@ describe('POST /hooks/permission/request', () => {
     expect(lines.some((e) => e.event === 'request_resolved' && e.status === 'allow')).toBe(true)
   })
 })
+
+// ── the journal names the rule (2026-08-01) ──────────────────────────────
+//
+// `request_created` used to record tool_name and nothing about WHY the card
+// appeared. The rule name was computed in the hook and dropped on the way
+// here, so every card cost a manual re-derivation. A function-level test would
+// not have caught it: the name was always correct where it was computed.
+describe('request_created names the rule, the fragment and the cwd', () => {
+  function auditLines(): Array<Record<string, unknown>> {
+    return readFileSync(paths.logs.permission_gate, 'utf8')
+      .trim()
+      .split('\n')
+      .map((l) => JSON.parse(l) as Record<string, unknown>)
+  }
+
+  test('rule, fragment and cwd reach the journal', async () => {
+    const { h } = await start(cfg(), (relay, requestId) => relay.answer(requestId, 'allow'))
+    await fetch(url(h, '/hooks/permission/request'), {
+      method: 'POST',
+      headers: AUTH,
+      body: body({
+        matched_rule: 'builtin:confirm_bash:git push',
+        matched_fragment: 'app && git push -u origin main',
+        cwd: '/srv/worktrees/feature-x',
+      }),
+    })
+    const created = auditLines().find((e) => e.event === 'request_created')
+    expect(created).toBeDefined()
+    expect(created!.matched_rule).toBe('builtin:confirm_bash:git push')
+    expect(created!.matched_fragment).toBe('app && git push -u origin main')
+    // Two worktrees of one repo produce byte-identical author/committer, so the
+    // git object cannot say which tree acted. The cwd can.
+    expect(created!.cwd).toBe('/srv/worktrees/feature-x')
+  })
+
+  test('a token-shaped fragment is redacted by the writer, not trusted', async () => {
+    // Defence in depth: the hook redacts too, but the route is what writes the
+    // file, so the guarantee has to hold at the write.
+    const { h } = await start(cfg(), (relay, requestId) => relay.answer(requestId, 'allow'))
+    await fetch(url(h, '/hooks/permission/request'), {
+      method: 'POST',
+      headers: AUTH,
+      body: body({
+        matched_rule: 'confirm:bash_patterns:curl',
+        matched_fragment: 'curl -H "Authorization: Bearer ghp_AbCdEfGhIjKlMnOpQrStUvWx0123456789"',
+      }),
+    })
+    const created = auditLines().find((e) => e.event === 'request_created')
+    expect(String(created!.matched_fragment)).not.toContain('ghp_AbCdEfGhIjKlMnOpQrStUvWx0123456789')
+    expect(created!.matched_fragment).toBe('[redacted]')
+  })
+
+  test('a request without the new fields still writes a record', async () => {
+    const { h } = await start(cfg(), (relay, requestId) => relay.answer(requestId, 'allow'))
+    await fetch(url(h, '/hooks/permission/request'), { method: 'POST', headers: AUTH, body: body() })
+    const created = auditLines().find((e) => e.event === 'request_created')
+    expect(created!.matched_rule).toBe('')
+    expect(created!.matched_fragment).toBe('')
+  })
+})
