@@ -171,3 +171,83 @@ describe('POST /hooks/permission/request', () => {
     expect(lines.some((e) => e.event === 'request_resolved' && e.status === 'allow')).toBe(true)
   })
 })
+
+// ── the journal names the rule (2026-08-01) ──────────────────────────────
+//
+// `request_created` used to record tool_name and nothing about WHY the card
+// appeared. The rule name was computed in the hook and dropped on the way
+// here, so every card cost a manual re-derivation. A function-level test would
+// not have caught it: the name was always correct where it was computed.
+describe('request_created names the rule and the cwd — and no command text', () => {
+  function auditLines(): Array<Record<string, unknown>> {
+    return readFileSync(paths.logs.permission_gate, 'utf8')
+      .trim()
+      .split('\n')
+      .map((l) => JSON.parse(l) as Record<string, unknown>)
+  }
+
+  test('rule and cwd reach the journal', async () => {
+    const { h } = await start(cfg(), (relay, requestId) => relay.answer(requestId, 'allow'))
+    await fetch(url(h, '/hooks/permission/request'), {
+      method: 'POST',
+      headers: AUTH,
+      body: body({
+        matched_rule: 'builtin:confirm_bash:git push',
+        cwd: '/srv/worktrees/feature-x',
+      }),
+    })
+    const created = auditLines().find((e) => e.event === 'request_created')
+    expect(created).toBeDefined()
+    expect(created!.matched_rule).toBe('builtin:confirm_bash:git push')
+    // Two worktrees of one repo produce byte-identical author/committer, so the
+    // git object cannot say which tree acted. The cwd can.
+    expect(created!.cwd).toBe('/srv/worktrees/feature-x')
+  })
+
+  test('the record has no command-text field at all', async () => {
+    // Not "the field is empty" — the field is gone. An older hook may still be
+    // on disk and still POST `matched_fragment`; the schema is not .strict(),
+    // so the key is accepted and dropped rather than 400-ing the request. What
+    // must not happen is it reaching the file.
+    const { h } = await start(cfg(), (relay, requestId) => relay.answer(requestId, 'allow'))
+    await fetch(url(h, '/hooks/permission/request'), {
+      method: 'POST',
+      headers: AUTH,
+      body: body({
+        matched_rule: 'confirm:bash_patterns:curl',
+        matched_fragment: 'curl -H "Authorization: Bearer ghp_AbCdEfGhIjKlMnOpQrStUvWx0123456789"',
+      }),
+    })
+    const created = auditLines().find((e) => e.event === 'request_created')
+    expect(created).toBeDefined()
+    expect('matched_fragment' in created!).toBe(false)
+    const raw = readFileSync(paths.logs.permission_gate, 'utf8')
+    expect(raw).not.toContain('matched_fragment')
+    expect(raw).not.toContain('ghp_AbCdEfGhIjKlMnOpQrStUvWx0123456789')
+    expect(raw).not.toContain('Authorization')
+  })
+
+  test('a secret-shaped operator pattern is redacted inside the rule label', async () => {
+    // MUST-2 (codex, PR #6): an operator rule label is assembled as
+    // `confirm:bash_patterns:<raw pattern from the policy file>`. The pattern
+    // is operator text and can name a key; the writer must not trust it.
+    const { h } = await start(cfg(), (relay, requestId) => relay.answer(requestId, 'allow'))
+    await fetch(url(h, '/hooks/permission/request'), {
+      method: 'POST',
+      headers: AUTH,
+      body: body({ matched_rule: 'confirm:bash_patterns:AKIAJ7EXAMPLE0KEY' }),
+    })
+    const created = auditLines().find((e) => e.event === 'request_created')
+    expect(String(created!.matched_rule)).not.toContain('AKIAJ7EXAMPLE0KEY')
+    // The KIND of rule survives — that is what makes the record useful.
+    expect(created!.matched_rule).toBe('confirm:bash_patterns:[redacted]')
+  })
+
+  test('a request without the new fields still writes a record', async () => {
+    const { h } = await start(cfg(), (relay, requestId) => relay.answer(requestId, 'allow'))
+    await fetch(url(h, '/hooks/permission/request'), { method: 'POST', headers: AUTH, body: body() })
+    const created = auditLines().find((e) => e.event === 'request_created')
+    expect(created!.matched_rule).toBe('')
+    expect(created!.cwd).toBe('')
+  })
+})

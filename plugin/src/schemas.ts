@@ -87,6 +87,17 @@ export const PermissionRequestRouteSchema = z.object({
   tool_name: z.string().min(1).max(256),
   preview: z.string().max(4096).default(''),
   reason: z.string().max(1024).default(''),
+  // Audit fields (2026-08-01). Optional with a default so an older hook binary
+  // keeps working — a missing rule name must not fail-closed the whole call.
+  //
+  // There is deliberately NO `matched_fragment`. A quoted piece of the command
+  // used to travel here for the journal; four review rounds produced five ways
+  // to slip a credential through the redaction that guarded it, so the field
+  // was removed rather than guarded a fifth time. `.strict()` is not used on
+  // this schema, so an older hook still sending the key is ignored rather than
+  // rejected — but nothing downstream reads it.
+  matched_rule: z.string().max(256).default(''),
+  cwd: z.string().max(4096).default(''),
   timeout_ms: z.number().int().positive().optional(),
 })
 export type PermissionRequestRoute = z.infer<typeof PermissionRequestRouteSchema>

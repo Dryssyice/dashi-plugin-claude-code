@@ -144,6 +144,12 @@ export function buildConfirmRequest(args: {
   readonly toolName: string
   readonly preview: string
   readonly reason: string
+  /** Rule that raised the card. Travels so the journal can name it — it used
+   *  to be computed here and dropped, leaving every card anonymous. */
+  readonly matchedRule?: string
+  /** Working directory of the call. Two worktrees of one repo yield identical
+   *  git author/committer, so the tree that acted is otherwise unrecoverable. */
+  readonly cwd?: string
 }): ConfirmRequest | BuildSkip {
   const { env } = args
   const base = env.TELEGRAM_WEBHOOK_URL
@@ -174,6 +180,13 @@ export function buildConfirmRequest(args: {
     tool_name: args.toolName,
     preview: args.preview,
     reason: args.reason,
+    matched_rule: args.matchedRule ?? '',
+    // No command text travels to the journal. The `preview` field above still
+    // carries the command, but that goes to the OPERATOR'S TELEGRAM PROMPT —
+    // a chat he reads and can delete — not to an append-only file on disk.
+    // Those are different sinks with different lifetimes, and only the second
+    // one was the problem.
+    cwd: args.cwd ?? '',
     timeout_ms: timeoutMs,
   })
   return {
@@ -375,8 +388,15 @@ async function main(): Promise<void> {
     : {}
   const preview = previewToolCall(toolName, ti)
   const reason = local.verdict?.reason ?? 'risky operation'
+  const matchedRule = local.verdict?.matchedRule ?? ''
+  // Claude Code puts the tool call's working directory in the envelope. Prefer
+  // it over process.cwd(): the hook process is not necessarily where the tool
+  // will run, and the point of the field is to name the tree that acted.
+  const cwd = typeof e.cwd === 'string' ? e.cwd : ''
 
-  const built = buildConfirmRequest({ env, sessionId, toolUseId, toolName, preview, reason })
+  const built = buildConfirmRequest({
+    env, sessionId, toolUseId, toolName, preview, reason, matchedRule, cwd,
+  })
   if ('kind' in built) {
     warn(built.reason)
     emit(renderDeny(built.reason))

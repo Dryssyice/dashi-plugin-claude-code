@@ -45,6 +45,23 @@ export interface PermissionVerdict {
   readonly matchedRule: string
 }
 
+// NO `matchedFragment` HERE, AND THAT IS THE DESIGN (PR #6, four review rounds).
+//
+// The verdict used to carry a quote of the command text that matched, so the
+// journal could show it. Four rounds produced five bypasses of the redaction
+// guarding it: exact names, prefixed names (`--db-password`), names split by
+// quotes (`PG'PASSWORD'=`), a name written as one word (`PGPASSWORD=`), an
+// assignment glued to a shell operator (`stage;PW=`), plus `redis-cli -a`.
+// What they share is not spelling, it is the PREMISE — that you can look at
+// command text and decide whether it is safe to write down. Every round
+// refuted that premise again, and one round's cosmetic fix (exempting
+// `docker run -u 1000:1000`) re-opened `curl -u 4815162:3423337`.
+//
+// So the field is gone rather than guarded better. "It is not written" is
+// proved by absence: nothing to go stale, nothing to bypass, nothing to watch.
+// `matchedRule` and `cwd` remain, and they are what was actually asked for —
+// a card that names its rule. The quote of the command was an addition.
+
 /** One tier's matchers. All fields optional; absent = matches nothing. */
 export interface PolicyRules {
   /** fnmatch globs against the tool name (e.g. "mcp__dashi-gbrain-*"). */
@@ -1869,6 +1886,10 @@ export function globMatch(pattern: string, value: string): boolean {
   }
 }
 
+// Reports only WHETHER the pattern hit. A locating variant returning the hit's
+// offset lived here while the journal quoted the command; the quote is gone
+// (see PermissionVerdict), and an offset nobody reads is a mechanism that
+// reads as a live one in review.
 function bashMatch(pattern: string, commandLower: string): boolean {
   const pat = pattern.toLowerCase()
   const hasMeta = pat.includes('*') || pat.includes('?')
@@ -1955,6 +1976,210 @@ function matchAllBashRules(rules: readonly string[], commandLower: string): stri
     if (bashMatch(rule, commandLower)) hits.push(rule)
   }
   return hits
+}
+
+// ── secret-shape scan: the one thing standing between the policy file and
+//    the append-only journal ────────────────────────────────────────────────
+//
+// The gate's journal recorded `request_created` without saying WHICH rule
+// raised the card, so every card cost a manual re-derivation. The rule name
+// closes that. NO command text travels with it — the field that quoted the
+// command is gone (see PermissionVerdict).
+//
+// The scan below is therefore reachable from exactly one caller,
+// `redactRuleForAudit`. That is not a leftover: an operator label reads
+// `confirm:bash_patterns:<raw pattern from the policy file>`, the pattern is
+// the operator's own text, and a pattern written to catch `--api-key` names a
+// credential by construction. Whatever is not caught here is appended to a
+// file that cannot be rewritten.
+
+/** Rule labels get their own, larger cap: a label truncated below the length
+ *  the schema accepts (256) stops matching any line in the policy file, and
+ *  naming the rule is the entire point of the field. */
+const RULE_MAX_CHARS = 256
+/** Stored instead of the text when the text cannot be shown safely. */
+export const FRAGMENT_REDACTED = '[redacted]'
+
+// Credential NAMES, in one string so the `name=value` form and the flag form
+// (`--password secret`) cannot drift apart.
+const CREDENTIAL_NAME =
+  'password|passwd|passphrase|secret|token|api[_-]?key|apikey|access[_-]?key|' +
+  'auth[_-]?token|private[_-]?key|client[_-]?secret|credential'
+
+const SECRET_SHAPED_RES: readonly RegExp[] = [
+  /-----BEGIN[ A-Z]*PRIVATE KEY/i,
+  // Vendor-prefixed keys: OpenAI/Stripe sk-/pk-/rk-, GitHub, Slack, AWS, Google.
+  /\b(?:sk|pk|rk)[-_][A-Za-z0-9_-]{8,}/i,
+  /\b(?:gh[pousr]|github_pat)_[A-Za-z0-9_]{10,}/,
+  /\bxox[abposr]-[A-Za-z0-9-]{8,}/i,
+  /\bAKIA[0-9A-Z]{8,}/,
+  /\bAIza[0-9A-Za-z_-]{10,}/,
+  // A credential NAME immediately followed by its value. The name alone is
+  // harmless prose ("rotate the token"); `name=`/`name:` means a value follows.
+  new RegExp(`\\b(?:${CREDENTIAL_NAME}|bearer)\\b\\s*[:=]`, 'i'),
+  /\bbearer\s+\S/i,
+  // FLAG form. The rule above needs `:`/`=` right after the name, so
+  // `--password hunter2` (value in the NEXT argv word) walked straight past it
+  // (reviewer, PR #6). Full names only: a bare `-p` would fire on `mkdir -p`.
+  new RegExp(`(?:^|\\s)--?(?:${CREDENTIAL_NAME})\\b(?:[=:]|\\s+)\\S`, 'i'),
+  // Basic auth as a `user:password` pair — in a `-u` flag or inside a URL.
+  // Round 2 carried a lookahead exempting an all-numeric pair, so that
+  // `docker run -u 1000:1000` would not read as a credential. It exempted
+  // `curl -u 4815162:3423337` just as well, and that one went to the journal
+  // whole (reviewer, round 4). Removed: a cosmetic false positive costs a
+  // needlessly redacted rule label, the exemption cost a credential.
+  /(?:^|\s)--?u(?:ser(?:name)?)?(?:[=:]|\s+)[^\s:/]+:[^\s]/i,
+  /\/\/[^\s/@:]+:[^\s/@]+@/,
+]
+
+// Credential NAMES as whole words. Round 1 matched a fixed list exactly, so
+// every ordinary spelling walked past: `--db-password`, `--pw`, `-P`, `PW=`
+// (reviewers, round 2). Entropy cannot cover for this — a human password is
+// short and low-entropy, which is exactly what an entropy rule ignores.
+const CREDENTIAL_WORDS = new Set([
+  'password', 'passwd', 'passphrase', 'pass', 'pw', 'pwd', 'secret', 'token',
+  'key', 'auth', 'apikey', 'apitoken', 'authtoken', 'accesskey', 'accesstoken',
+  'privatekey', 'clientsecret', 'credential', 'credentials', 'otp', 'pin',
+  'totp', 'session', 'sessionid', 'sessionkey', 'cookie', 'bearer',
+])
+
+// Tails that make a COMPOUND name a credential name (`db-password`,
+// `api_token`, `proxy.secret`). Only compounds: matching a bare suffix against
+// the whole name would turn `--monkey` into a key.
+const CREDENTIAL_TAILS = new Set([
+  'password', 'passwd', 'passphrase', 'pass', 'pw', 'pwd', 'secret', 'token',
+  'key', 'apikey', 'otp', 'pin', 'credential', 'credentials', 'auth',
+])
+
+function isCredentialName(rawName: string): boolean {
+  const name = rawName.replace(/^-+/, '').toLowerCase()
+  if (name.length === 0) return false
+  if (CREDENTIAL_WORDS.has(name.replace(/[-_.]/g, ''))) return true
+  const parts = name.split(/[-_.]/).filter((p) => p.length > 0)
+  if (parts.length < 2) return false
+  return CREDENTIAL_TAILS.has(parts[parts.length - 1] as string)
+}
+
+/**
+ * A credential NAME followed by its value, in any of the forms a person types:
+ * `--db-password hunter2`, `--pw=x`, `PW=x`, `-P x`, `login <user> <secret>`.
+ * The value is refused whatever its length or entropy — `--pin 8471` is a
+ * secret and looks like nothing at all.
+ */
+function credentialTokenCarriesValue(text: string): boolean {
+  const tokens = text.split(/\s+/).filter((t) => t.length > 0)
+  for (let i = 0; i < tokens.length; i++) {
+    const tok = tokens[i] as string
+    const next = tokens[i + 1]
+    const nextIsValue = next !== undefined && !next.startsWith('-')
+    // `-P value` is mysql's password flag. CASE-SENSITIVE on purpose: the
+    // lowercase `-p` belongs to `mkdir -p` and `docker run -p 80:80`, and
+    // treating it as a credential would bury the journal in [redacted].
+    if (tok === '-P' && nextIsValue) return true
+    const eq = tok.indexOf('=')
+    if (eq > 0) {
+      const name = tok.slice(0, eq)
+      if (/^-{0,2}[A-Za-z][\w.-]*$/.test(name) && isCredentialName(name) && tok.length > eq + 1) {
+        return true
+      }
+      continue
+    }
+    if (!tok.startsWith('-')) {
+      // `login <user> <secret>`: the verb takes the credential as an operand,
+      // so no flag name is there to recognise. Two operands are required, so a
+      // bare `login` (which prompts interactively) is not touched.
+      if (/^["']?(?:login|signin)["']?$/i.test(tok)) {
+        const operands = tokens.slice(i + 1).filter((t) => !t.startsWith('-'))
+        if (operands.length >= 2) return true
+      }
+      continue
+    }
+    if (isCredentialName(tok) && nextIsValue) return true
+  }
+  return false
+}
+
+/** lower / upper / digit classes present in a token. Symbols deliberately do
+ *  NOT count: `restore-lost-rules-20260801` is a branch name, not a key. */
+function alnumClassCount(token: string): number {
+  return (/[a-z]/.test(token) ? 1 : 0) + (/[A-Z]/.test(token) ? 1 : 0) + (/[0-9]/.test(token) ? 1 : 0)
+}
+
+/**
+ * An opaque encoded run. A plain `[A-Za-z0-9_-]{32,}` rule missed base64
+ * outright: `+`, `/` and `=` are not in that class, so one blob read as several
+ * short tokens (reviewer, PR #6). Split on characters that never appear INSIDE
+ * an encoded credential, then judge each piece.
+ */
+function opaqueRunLooksSecret(text: string): boolean {
+  for (const token of text.split(/[^A-Za-z0-9+=_-]+/)) {
+    if (token.length >= 32 && /^[A-Za-z0-9_-]+$/.test(token)) return true
+    // Mixed case AND digits over a long run is machine-generated, not prose.
+    if (token.length >= 24 && alnumClassCount(token) === 3) return true
+    // Base64 padding gives it away on its own, at a lower length.
+    if (token.length >= 16 && /^[A-Za-z0-9+]+={1,2}$/.test(token)) return true
+  }
+  return false
+}
+
+// Characters that render as nothing. `bearer<ZWSP> value` hid the credential
+// name from the detector until these were removed before the scan.
+const ZERO_WIDTH_RE = /[\u00ad\u200b-\u200f\u2060\ufeff]/g
+
+/**
+ * Fold text into the form the detectors are written against, for the DECISION
+ * only — what gets stored stays as the operator typed it. NFKC maps fullwidth
+ * punctuation onto ASCII, so `token：value` can no longer hide from `name:`.
+ */
+function normalizeForSecretScan(text: string): string {
+  let folded: string
+  try {
+    folded = text.normalize('NFKC')
+  } catch {
+    folded = text // exotic input: scan it unfolded rather than skip the scan
+  }
+  return folded.replace(ZERO_WIDTH_RE, '')
+}
+
+/** Does this text carry something that must never reach the journal? */
+export function fragmentIsSecretShaped(text: string): boolean {
+  const scanned = normalizeForSecretScan(text)
+  return (
+    SECRET_SHAPED_RES.some((re) => re.test(scanned)) ||
+    credentialTokenCarriesValue(scanned) ||
+    opaqueRunLooksSecret(scanned)
+  )
+}
+
+/**
+ * Zero-width characters out, control characters and whitespace runs collapsed
+ * to one space. The class is control-characters-plus-space and DEL; it must
+ * NOT include the hyphen -- `git reset --hard` written to the journal as
+ * `git reset hard` reads as a quote of the command while being a different
+ * command.
+ */
+function redactableFlatten(text: string): string {
+  return text
+    .replace(ZERO_WIDTH_RE, '')
+    .replace(/[\u0000-\u0020\u007f]+/g, ' ')
+    .trim()
+}
+
+/**
+ * A rule label is `<tier>:<kind>:<pattern>`, and for operator rules the pattern
+ * is text straight from the policy file — a pattern naming a key would be
+ * copied into an append-only log verbatim (codex, PR #6). Tier and kind are
+ * ours and always safe, so only the pattern is dropped: a record that still
+ * says WHICH kind of rule fired keeps its whole value.
+ */
+export function redactRuleForAudit(rule: string): string {
+  const collapsed = redactableFlatten(rule)
+  const flat = collapsed.length > RULE_MAX_CHARS ? collapsed.slice(0, RULE_MAX_CHARS) : collapsed
+  if (flat.length === 0) return ''
+  const parts = flat.split(':')
+  if (parts.length < 3) return fragmentIsSecretShaped(flat) ? FRAGMENT_REDACTED : flat
+  const pattern = parts.slice(2).join(':')
+  return fragmentIsSecretShaped(pattern) ? `${parts[0]}:${parts[1]}:${FRAGMENT_REDACTED}` : flat
 }
 
 /** Merge global + scope rules for one tier (scope rules are additive). */
@@ -2095,6 +2320,7 @@ export function classifyToolCall(input: ClassifyInput): PermissionVerdict {
       return { tier: 'deny', reason: `catastrophic command blocked: ${catastrophic}`, matchedRule: `builtin:deny_bash:${catastrophic}` }
     }
     if (bashReferencesSecret(rawCommand)) {
+      // NO fragment here on purpose: the matching text IS the secret reference.
       return { tier: 'deny', reason: 'secret/credential reference in Bash command blocked', matchedRule: 'builtin:deny_bash_secret' }
     }
     // Non-overridable HARD-DENY: a mutating systemctl on the agent's OWN comms
@@ -2128,7 +2354,11 @@ export function classifyToolCall(input: ClassifyInput): PermissionVerdict {
     const hits = matchAllBashRules(BUILTIN_CONFIRM_BASH, commandLower)
     const standing = hits.filter((h) => !overridden.includes(h))
     if (standing.length > 0) {
-      return { tier: 'confirm', reason: `risky command needs confirmation: ${standing[0]}`, matchedRule: `builtin:confirm_bash:${standing[0]}` }
+      return {
+        tier: 'confirm',
+        reason: `risky command needs confirmation: ${standing[0]}`,
+        matchedRule: `builtin:confirm_bash:${standing[0]}`,
+      }
     }
     // Pass the RAW command (commandLower !== undefined ⇒ rawCommand defined):
     // the detector is quote/heredoc-aware and matches command names case-
@@ -2142,6 +2372,8 @@ export function classifyToolCall(input: ClassifyInput): PermissionVerdict {
     // RAW command (commandLower !== undefined ⇒ rawCommand defined) so the
     // case-sensitive `-c` check distinguishes `git -C` from `git -c`.
     if (gitExecSurface(rawCommand!)) {
+      // Structural detector, and on the fail-closed branch (unparseable quoting)
+      // nothing "matched" at all — the command simply could not be proven safe.
       return { tier: 'confirm', reason: 'git config/hook execution surface needs confirmation', matchedRule: 'builtin:confirm_bash:git-exec-surface' }
     }
     // (own-channel systemctl hard-deny was hoisted into the step-2b hard-deny
@@ -2151,7 +2383,11 @@ export function classifyToolCall(input: ClassifyInput): PermissionVerdict {
   // 5. Operator confirm.
   const confirmHit = rulesMatch(confirmRules, toolName, pathCands, commandLower)
   if (confirmHit) {
-    return { tier: 'confirm', reason: `policy confirm (${confirmHit})`, matchedRule: `confirm:${confirmHit}` }
+    return {
+      tier: 'confirm',
+      reason: `policy confirm (${confirmHit})`,
+      matchedRule: `confirm:${confirmHit}`,
+    }
   }
 
   // 6. Operator allow.

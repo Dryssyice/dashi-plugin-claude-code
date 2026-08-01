@@ -10,6 +10,7 @@ import type { StatePaths } from '../../config.js'
 import { resolvePermissionGateAllowedUserIds } from '../../config.js'
 import type { Logger } from '../../log.js'
 import { PermissionRequestRouteSchema, type PermissionRequestRoute } from '../../schemas.js'
+import { redactRuleForAudit } from '../../security/permission-policy.js'
 import type { WebhookDeps } from '../server.js'
 import { authGate, readJsonBody, reply } from './shared.js'
 
@@ -134,6 +135,24 @@ export async function handlePermissionRequest(
       session_id: payload.session_id,
       tool_name: payload.tool_name,
       chat_id: chatId,
+      // Which rule raised the card. Without it the record said only "a card
+      // appeared", and the rule had to be re-derived by hand every time (six
+      // days of it, 2026-08-01).
+      // The rule label ends in the operator's own pattern from the policy file
+      // (`confirm:bash_patterns:<pattern>`), so it is untrusted text too — a
+      // pattern naming a key would otherwise be copied here verbatim (codex).
+      matched_rule: redactRuleForAudit(payload.matched_rule),
+      // NO command text is recorded. A quoted fragment of the command lived
+      // here until 2026-08-01; four review rounds found five ways to walk a
+      // credential past its redaction, so the field is gone rather than
+      // guarded again. What "why was I asked" needs is the rule name, and that
+      // is above.
+      //
+      // The working directory of the call: two worktrees of one repository
+      // produce byte-identical git author/committer, so the object alone cannot
+      // say which tree acted. Written as received and NOT redacted — a path is
+      // not a command, and no argument values reach this field.
+      cwd: payload.cwd,
       timeout_ms: effectiveTimeoutMs,
     })
     try {
