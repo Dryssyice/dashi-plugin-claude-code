@@ -7,6 +7,7 @@ import {
   redactRuleForAudit,
   guardFragmentForJournal,
   FRAGMENT_REDACTED,
+  FRAGMENT_NOT_QUOTED,
   FRAGMENT_MAX_CHARS,
   type PermissionPolicy,
   PermissionPolicySchema,
@@ -1579,7 +1580,10 @@ describe('the secret decision is made on the whole command, not on the window', 
   test('a secret far outside the window still redacts the whole fragment', () => {
     // 200 chars away from the match: the window would never have seen it, and
     // that was the bug — the window decided, so distance meant safety.
-    const far = 'export API_KEY=sk-live_0a1b2c3d4e5f6a7b8c9d ' + ' '.repeat(120) + '&& psql -c "select 1"'
+    // Quote-free on purpose: since round 3 a quoted command never reaches the
+    // secret detectors at all, so a quoted sample would test the narrowing
+    // instead of the thing this case is about.
+    const far = 'export API_KEY=sk-live_0a1b2c3d4e5f6a7b8c9d ' + ' '.repeat(120) + '&& psql -c select1'
     expect(fragmentOf(far)).toBe(FRAGMENT_REDACTED)
   })
 
@@ -1587,7 +1591,7 @@ describe('the secret decision is made on the whole command, not on the window', 
     expect(fragmentOf('psql --password hunter2correct -h db')).toBe(FRAGMENT_REDACTED)
     expect(fragmentOf('curl -u admin:s3cr3tvalue https://api.example/x')).toBe(FRAGMENT_REDACTED)
     expect(fragmentOf('curl https://user:p4ssw0rd@api.example/x')).toBe(FRAGMENT_REDACTED)
-    expect(fragmentOf('curl --header "X-Api-Key: 8f3b1c9d2e4a6b8c" https://x/y')).toBe(FRAGMENT_REDACTED)
+    expect(fragmentOf('psql --api-key 8f3b1c9d2e4a6b8c -h db')).toBe(FRAGMENT_REDACTED)
   })
 
   test('base64 survives the character class that broke the plain run rule', () => {
@@ -1597,22 +1601,23 @@ describe('the secret decision is made on the whole command, not on the window', 
   })
 
   test('a heredoc body is scanned too, not just the line of the match', () => {
-    const cmd = "psql -f - <<'SQL'\n-- deploy token: ghp_QqWwEeRrTtYyUuIiOoPp0123456789\nSQL"
+    // Unquoted delimiter: a quoted one (`<<'SQL'`) would stop at the narrowing.
+    const cmd = 'psql -f - <<SQL\n-- deploy token: ghp_QqWwEeRrTtYyUuIiOoPp0123456789\nSQL'
     expect(fragmentOf(cmd)).toBe(FRAGMENT_REDACTED)
   })
 
   test('zero-width and fullwidth characters cannot hide the credential name', () => {
     const ZWSP = String.fromCharCode(0x200b)
     const FULLWIDTH_COLON = String.fromCharCode(0xff1a)
-    expect(fragmentOf(`curl -H "bearer${ZWSP} tOkEnValue12345678" https://x`)).toBe(FRAGMENT_REDACTED)
-    expect(fragmentOf(`curl -H "token${FULLWIDTH_COLON} tOkEnValue12345678" https://x`)).toBe(FRAGMENT_REDACTED)
+    expect(fragmentOf(`psql -h db bearer${ZWSP} tOkEnValue12345678`)).toBe(FRAGMENT_REDACTED)
+    expect(fragmentOf(`psql -h db token${FULLWIDTH_COLON}tOkEnValue12345678`)).toBe(FRAGMENT_REDACTED)
   })
 
   // NEGATIVE CONTROL. Redacting everything would pass every test above and be
   // useless: the point of the field is to quote the command. These must keep
   // their text — including the operator's own branch name, a 32-char run.
   test('ordinary commands keep a readable fragment', () => {
-    const f = fragmentOf('cd /srv && psql -h db.internal -c "select count(*) from users" -o /tmp/out')
+    const f = fragmentOf('cd /srv && psql -h db.internal -f /srv/report.sql -o /tmp/out')
     expect(f).toContain('psql -h db.internal')
     expect(f).not.toBe(FRAGMENT_REDACTED)
 
@@ -1682,6 +1687,51 @@ describe('credential names: suffixes, short spellings, short values', () => {
   })
 })
 
+// ── PR #6 round 3: the tool is narrowed, not extended again ──────────────
+//
+// Three rounds, and each one the same half produced a new bypass: exact names,
+// then prefixed names, then names broken by quotes. That is an open list, not
+// a set of cases — the next entries are `$'PASS'`, backslash joining, variable
+// substitution. So the default is inverted: a fragment is written only when
+// the whole command is provably plain. Quote parsing is precisely where we
+// have been wrong three times, so we do not parse quotes at all.
+describe('a command carrying shell quoting is not quoted in the journal', () => {
+  test("codex probe 1: a name broken by quotes inside an env assignment", () => {
+    const f = fragmentOf("env PG'PASSWORD'=hunter2 psql -h db")
+    expect(f).not.toContain('hunter2')
+    expect(f).toBe(FRAGMENT_NOT_QUOTED)
+  })
+
+  test('codex probe 2: a name broken by quotes inside a flag', () => {
+    const f = fragmentOf("--db-'password' hunter2 psql")
+    expect(f).not.toContain('hunter2')
+    expect(f).toBe(FRAGMENT_NOT_QUOTED)
+  })
+
+  test('every escaping character counts, not only the quote', () => {
+    expect(fragmentOf('psql -h db -c select\\ 1')).toBe(FRAGMENT_NOT_QUOTED)
+    expect(fragmentOf('psql -h $DB_HOST')).toBe(FRAGMENT_NOT_QUOTED)
+    expect(fragmentOf('psql -h `hostname`')).toBe(FRAGMENT_NOT_QUOTED)
+    expect(fragmentOf('psql -h "db"')).toBe(FRAGMENT_NOT_QUOTED)
+  })
+
+  // THE PRICE, recorded as expected behaviour rather than discovered later in
+  // the journal: an ordinary quoted command with no secret in it loses its
+  // fragment too. matched_rule and cwd still answer "why was I asked".
+  test('price: a harmless quoted command also loses its fragment', () => {
+    const f = fragmentOf('psql -h db.internal -c "select count(*) from users"')
+    expect(f).toBe(FRAGMENT_NOT_QUOTED)
+    expect(f).not.toContain('select count')
+  })
+
+  // NEGATIVE CONTROL: without quoting, nothing changes.
+  test('a plain command still gets its quote', () => {
+    const f = fragmentOf('cd /srv && psql -h db.internal -U app_service')
+    expect(f).toContain('psql -h db.internal')
+    expect(f).not.toBe(FRAGMENT_NOT_QUOTED)
+  })
+})
+
 // MUST-2 round 2: `bash_patterns` accept globs, and `*` becomes `.*`, so the
 // match ran to the end of the line and the "16 chars of context" window became
 // the whole command. The window must be bounded by its OWN length, whatever
@@ -1737,12 +1787,12 @@ describe('cost of the whole-command scan (documented, not endorsed)', () => {
     const sha40 = 'da39a3ee5e6b4b0d3255bfef95601890afd80709'
     const uuid = '3f2504e0-4f89-11d3-9a0c-0305e82c3301'
     const container = '9f2b7c1d4e6a8b0c2d4e6f8a0b2c4d6e'
-    expect(fragmentOf(`psql -c "select 1" -- ${sha40}`)).toBe(FRAGMENT_REDACTED)
+    expect(fragmentOf(`psql -f q.sql -- ${sha40}`)).toBe(FRAGMENT_REDACTED)
     expect(fragmentOf(`psql --session-note ${uuid}`)).toBe(FRAGMENT_REDACTED)
     expect(fragmentOf(`docker exec ${container} psql`)).toBe(FRAGMENT_REDACTED)
   })
   test('but ordinary work keeps its quote', () => {
-    expect(fragmentOf('cd /srv && psql -h db.internal -c "select 1"')).toContain('psql -h db.internal')
+    expect(fragmentOf('cd /srv && psql -h db.internal -f q.sql')).toContain('psql -h db.internal')
     const branch = classify(
       'Bash',
       { command: 'git push -u origin feature/permission-gate-fragment' },

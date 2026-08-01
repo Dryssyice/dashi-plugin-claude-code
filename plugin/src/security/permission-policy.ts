@@ -2007,6 +2007,30 @@ export const FRAGMENT_MAX_CHARS = 120
 /** Stored instead of the text when the text cannot be shown safely. */
 export const FRAGMENT_REDACTED = '[redacted]'
 
+/**
+ * Stored instead of the text when the command carries shell quoting or
+ * substitution. Read by the operator, hence Russian, and deliberately not the
+ * same marker as FRAGMENT_REDACTED: "we refused to quote this" and "we found
+ * something secret in it" are different facts about the command.
+ */
+export const FRAGMENT_NOT_QUOTED = '[фрагмент не записан: команда содержит экранирование]'
+
+/**
+ * Quoting / substitution characters. Their presence means we do not write a
+ * fragment at all.
+ *
+ * WHY SO BLUNT (reviewers, PR #6, third bypass in the same half): the name
+ * detectors work on whitespace-separated raw tokens, so a quote placed inside
+ * a name defeats them — `env PG'PASSWORD'=hunter2 psql` scanned clean and the
+ * journal received `SSWORD'=hunter2 psql -h db`, value included. Removing the
+ * quotes ourselves is not the fix: quote parsing is the exact thing we have
+ * now got wrong three times (exact names, prefixed names, quoted names), and
+ * the remaining bypasses -- `$'PASS'`, backslash joining, variable
+ * substitution -- are an open list. So the DEFAULT is inverted: a fragment is
+ * written only when the whole command is provably plain.
+ */
+const SHELL_QUOTING_RE = /['"\\$`]/
+
 // Shapes that mean "this text is a credential, not a command". Deliberately
 // about VALUES, not paths: a secret PATH (.env, id_rsa, ~/.aws) is already a
 // hard-deny above and never reaches a confirm card, but an inline token in an
@@ -2264,6 +2288,15 @@ function bashFragment(rawCommand: string, commandLower: string, pattern: string)
   // command by those indices would then cut a window we never inspected, and a
   // window nobody inspected is exactly how a token reaches a log. Only trust
   // the raw text when the lengths prove the two strings are still aligned.
+  // NARROWING (round 3) — this stands BEFORE every detector below because it
+  // is cruder and therefore more reliable than all of them. If the command
+  // carries any quoting or substitution we do not attempt to quote it at all.
+  // The cost is real and accepted: an ordinary `psql -c "select 1"` loses its
+  // fragment. matched_rule and cwd stay, and they are the answer to "why was I
+  // asked" — the fragment was only ever convenience, and convenience loses to
+  // a password sitting in an append-only file.
+  if (SHELL_QUOTING_RE.test(rawCommand)) return FRAGMENT_NOT_QUOTED
+
   // The DECISION is always taken on the raw command. Round 2 judged the
   // lowercased copy whenever some character changed length under toLowerCase,
   // and a single U+0130 therefore switched off every case-sensitive detector
