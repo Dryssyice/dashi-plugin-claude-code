@@ -135,9 +135,9 @@ export async function handlePermissionRequest(
       session_id: payload.session_id,
       tool_name: payload.tool_name,
       chat_id: chatId,
-      // Which rule raised the card, and the text it matched. Without these the
-      // record said only "a card appeared", and the rule had to be re-derived
-      // by hand every time (six days of it, 2026-08-01).
+      // Which rule raised the card. Without it the record said only "a card
+      // appeared", and the rule had to be re-derived by hand every time (six
+      // days of it, 2026-08-01).
       // The rule label ends in the operator's own pattern from the policy file
       // (`confirm:bash_patterns:<pattern>`), so it is untrusted text too — a
       // pattern naming a key would otherwise be copied here verbatim (codex).

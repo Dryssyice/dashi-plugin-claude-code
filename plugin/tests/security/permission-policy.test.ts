@@ -1542,3 +1542,142 @@ describe('fragmentIsSecretShaped — the one surviving consumer is redactRuleFor
     expect(fragmentIsSecretShaped('supabase db')).toBe(false)
   })
 })
+
+// ── the surviving detectors, asserted through the surviving sink ──────────
+//
+// Round 4 deleted the fragment, and with it some forty assertions that ran
+// through `fragmentOf()`. What those had been holding up was the secret-shape
+// scan — which stayed, because `redactRuleForAudit` needs it. The reviewer
+// then blinded three of its detectors on a copy of the tree and ran all 105
+// test files: nothing moved. A live mechanism with nothing proving it alive is
+// worse than a dead one — the next person to "simplify" CREDENTIAL_NAME or
+// drop the NFKC fold gets a green run and ships a hole.
+//
+// The path being defended is concrete: the operator writes a pattern into
+// `permission-policy.yaml`, the label becomes
+// `confirm:bash_patterns:<that pattern>`, and the label is APPENDED TO A FILE
+// that is never rewritten. A pattern written to catch `--api-key` names a
+// credential by construction.
+//
+// Every case below enters through `redactRuleForAudit` — the public entry, not
+// the internals — and each is chosen so that exactly ONE detector can answer
+// it. That claim is checked by blinding each detector in turn, not by reading.
+const KIND = 'confirm:bash_patterns:'
+const DROPPED = `${KIND}${FRAGMENT_REDACTED}`
+function auditLabel(pattern: string): string {
+  return redactRuleForAudit(KIND + pattern)
+}
+
+describe('rule label: a credential NAME carrying its value', () => {
+  // Only credentialTokenCarriesValue can answer these: no vendor prefix, no
+  // `name:`/`name=` for the shape list to see, and values too short and too
+  // plain for the opaque-run rule.
+  test('flag forms, the ones people actually type', () => {
+    expect(auditLabel('--db-password hunter2')).toBe(DROPPED)
+    expect(auditLabel('--proxy-password hunter2')).toBe(DROPPED)
+    expect(auditLabel('--pw hunter2')).toBe(DROPPED)
+    expect(auditLabel('-P hunter2')).toBe(DROPPED)
+  })
+  test('an assignment, and a value with no shape at all', () => {
+    expect(auditLabel('PW=hunter2')).toBe(DROPPED)
+    // `--pin 8471` is a secret that looks like nothing. Length and entropy are
+    // not the test, which is exactly why the entropy fence could not do this.
+    expect(auditLabel('--pin 8471')).toBe(DROPPED)
+  })
+  test('a verb taking the credential as an operand', () => {
+    expect(auditLabel('login andrei hunter2')).toBe(DROPPED)
+  })
+  // NEGATIVE CONTROLS. Redacting every label would pass every case above and
+  // destroy the field's whole value: the operator must still see WHICH of his
+  // patterns fired.
+  test('ordinary operator patterns keep their text', () => {
+    expect(auditLabel('deploy.sh')).toBe(`${KIND}deploy.sh`)
+    expect(auditLabel('--monkey business')).toBe(`${KIND}--monkey business`)
+    expect(auditLabel('mkdir -p /tmp/x')).toBe(`${KIND}mkdir -p /tmp/x`)
+    expect(auditLabel('git push origin feature/')).toBe(`${KIND}git push origin feature/`)
+  })
+})
+
+describe('rule label: a name hidden by characters that render as nothing', () => {
+  // Built from char codes on purpose: a literal zero-width or fullwidth
+  // character in a source file is invisible in review and turns the file
+  // binary to grep.
+  const ZWSP = String.fromCharCode(0x200b)
+  const FULLWIDTH_COLON = String.fromCharCode(0xff1a)
+  const SOFT_HYPHEN = String.fromCharCode(0x00ad)
+
+  test('a zero-width character inside the name does not hide it', () => {
+    // Without a zero-width strip the name reads as `pass<ZWSP>word`, which is
+    // in no list, and the pattern goes to the journal whole.
+    //
+    // Measured, not assumed: this case holds the PAIR of strips, not either
+    // one. Zero-width characters are removed twice before the decision — in
+    // `redactableFlatten` and again in `normalizeForSecretScan` — so blinding
+    // either alone leaves this green, and only blinding both turns it red.
+    // Which means one of the two could be deleted today and no test in the
+    // repository would say a word. That is a redundancy, not a hole, and it is
+    // written down here so the next reader does not have to rediscover it.
+    expect(auditLabel(`--pass${ZWSP}word hunter2`)).toBe(DROPPED)
+    expect(auditLabel(`--api${SOFT_HYPHEN}key hunter2`)).toBe(DROPPED)
+  })
+  test('a fullwidth colon does not hide the name=value shape', () => {
+    // NFKC maps U+FF1A onto ASCII ':'. Without the fold, `token：hunter2` is a
+    // single token with no `=`, no leading dash and no known name.
+    expect(auditLabel(`token${FULLWIDTH_COLON}hunter2`)).toBe(DROPPED)
+  })
+  test('the fold decides only — it never rewrites what is stored', () => {
+    // A harmless fullwidth character must survive into the journal as typed:
+    // a "quote" that is quietly not what the operator wrote is worse than none.
+    const FULLWIDTH_A = String.fromCharCode(0xff21)
+    expect(auditLabel(`deploy${FULLWIDTH_A}.sh`)).toBe(`${KIND}deploy${FULLWIDTH_A}.sh`)
+  })
+})
+
+describe('rule label: an opaque encoded run', () => {
+  // Only opaqueRunLooksSecret can answer these: no credential name anywhere,
+  // no vendor prefix, nothing for the name rules to bite on.
+  test('a long opaque run, with or without a known prefix', () => {
+    expect(auditLabel('A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7')).toBe(DROPPED)
+    expect(auditLabel('q7x2m9k4z8v3n6b1w5j0t7r2y4u6i8o0')).toBe(DROPPED)
+  })
+  test('mixed case plus digits over a long run', () => {
+    expect(auditLabel('Xk7pQ2zRm9tLv4Bn8sWc3dJq')).toBe(DROPPED)
+  })
+  test('base64 padding gives it away at a shorter length', () => {
+    // `+`, `/` and `=` are outside [A-Za-z0-9_-], so a plain "32-char run" rule
+    // read this as several short tokens (reviewer, PR #6 round 1).
+    expect(auditLabel('aGVsbG8sIHdvcmxkIQ==')).toBe(DROPPED)
+  })
+  // NEGATIVE CONTROL: the operator's own branch names are long and hyphenated
+  // and must not read as keys, or every label becomes [redacted].
+  test('long hyphenated prose is not an encoded run', () => {
+    expect(auditLabel('restore-lost-rules-20260801')).toBe(`${KIND}restore-lost-rules-20260801`)
+    expect(auditLabel('supabase db reset --linked')).toBe(`${KIND}supabase db reset --linked`)
+  })
+})
+
+describe('rule label: what survives redaction is the KIND of rule', () => {
+  test('tier and kind are ours and always kept', () => {
+    const out = auditLabel('--db-password hunter2')
+    expect(out.startsWith('confirm:bash_patterns:')).toBe(true)
+    expect(out).not.toContain('hunter2')
+  })
+  test('a label with no pattern part is judged whole', () => {
+    expect(redactRuleForAudit('default:allow')).toBe('default:allow')
+    expect(redactRuleForAudit('weird: --db-password hunter2')).toBe(FRAGMENT_REDACTED)
+  })
+  test('the cap is the schema’s, and the scan sees exactly what is stored', () => {
+    // The label is capped at 256 — the length the route's schema accepts, so a
+    // capped label still matches a line in the policy file. The cap is applied
+    // BEFORE the scan, which is safe only because the scan then runs on the
+    // very bytes that will be written: a secret past the cap is not judged
+    // because it is not stored either. The filler is prose with spaces on
+    // purpose — an unbroken 256-character run is itself an opaque run, which
+    // would redact the label for a reason that has nothing to do with the cap.
+    const beyond = auditLabel('deploy step '.repeat(30) + '--db-password hunter2')
+    expect(beyond.length).toBe(256)
+    expect(beyond).not.toContain('hunter2')
+    // ...and a secret INSIDE the cap is still dropped, cap or no cap.
+    expect(auditLabel('--db-password hunter2 ' + 'deploy step '.repeat(30))).toBe(DROPPED)
+  })
+})

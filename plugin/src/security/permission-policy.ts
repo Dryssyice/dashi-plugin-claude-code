@@ -1978,15 +1978,20 @@ function matchAllBashRules(rules: readonly string[], commandLower: string): stri
   return hits
 }
 
-// ── audit fragment: the text that matched, and nothing else ──────────────
+// ── secret-shape scan: the one thing standing between the policy file and
+//    the append-only journal ────────────────────────────────────────────────
 //
 // The gate's journal recorded `request_created` without saying WHICH rule
 // raised the card, so every card cost a manual re-derivation. The rule name
-// was already computed; the matched TEXT existed nowhere. Both now travel to
-// the journal — but the command may hold a token, a key path or an inline
-// credential, so the fragment is a bounded window that is dropped whole the
-// moment it looks like a secret. An empty field costs a reader one guess; a
-// token in an append-only log cannot be taken back.
+// closes that. NO command text travels with it — the field that quoted the
+// command is gone (see PermissionVerdict).
+//
+// The scan below is therefore reachable from exactly one caller,
+// `redactRuleForAudit`. That is not a leftover: an operator label reads
+// `confirm:bash_patterns:<raw pattern from the policy file>`, the pattern is
+// the operator's own text, and a pattern written to catch `--api-key` names a
+// credential by construction. Whatever is not caught here is appended to a
+// file that cannot be rewritten.
 
 /** Rule labels get their own, larger cap: a label truncated below the length
  *  the schema accepts (256) stops matching any line in the policy file, and
