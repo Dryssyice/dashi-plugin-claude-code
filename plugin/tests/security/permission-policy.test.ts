@@ -1634,6 +1634,124 @@ describe('the secret decision is made on the whole command, not on the window', 
   })
 })
 
+// ── PR #6 round 2 ────────────────────────────────────────────────────────
+//
+// Round 1 matched credential names EXACTLY, so every ordinary spelling of the
+// same thing walked past: `--db-password`, `--pw`, `-P`, `PW=`. Entropy cannot
+// rescue these — a human password is short and low-entropy by nature.
+describe('credential names: suffixes, short spellings, short values', () => {
+  test('a vendor-prefixed name is still a password name', () => {
+    expect(fragmentOf('--db-password hunter2correct psql -h db')).toBe(FRAGMENT_REDACTED)
+    expect(fragmentOf('--proxy-password hunter2correct psql -h db')).toBe(FRAGMENT_REDACTED)
+    expect(fragmentOf('psql --api-token abcdefgh12345678')).toBe(FRAGMENT_REDACTED)
+    expect(fragmentOf('psql --client_secret abcdefgh12345678')).toBe(FRAGMENT_REDACTED)
+  })
+
+  test('the short spellings people actually type', () => {
+    expect(fragmentOf('psql --pw hunter2correct')).toBe(FRAGMENT_REDACTED)
+    expect(fragmentOf('psql --pass hunter2correct')).toBe(FRAGMENT_REDACTED)
+    expect(fragmentOf('psql --auth hunter2correct')).toBe(FRAGMENT_REDACTED)
+    expect(fragmentOf('psql --key hunter2correct')).toBe(FRAGMENT_REDACTED)
+    // Uppercase -P is mysql's password flag. Lowercase -p is NOT included:
+    // `mkdir -p`, `docker run -p 80:80` would drown the journal in [redacted].
+    expect(fragmentOf('psql -P hunter2correct')).toBe(FRAGMENT_REDACTED)
+  })
+
+  test('environment assignments, not only flags', () => {
+    expect(fragmentOf('PW=hunter2correct psql -h db')).toBe(FRAGMENT_REDACTED)
+    expect(fragmentOf('SESSION=abcdef123456 psql -h db')).toBe(FRAGMENT_REDACTED)
+  })
+
+  test('a short value is still a secret — length and entropy are not the test', () => {
+    expect(fragmentOf('psql --otp 837451')).toBe(FRAGMENT_REDACTED)
+    expect(fragmentOf('psql --pin 8471')).toBe(FRAGMENT_REDACTED)
+  })
+
+  test('a login verb carrying a user and a secret', () => {
+    expect(fragmentOf('psql -h db; login andrei hunter2correct')).toBe(FRAGMENT_REDACTED)
+  })
+
+  // NEGATIVE CONTROLS for the suffix rule. `--monkey` ends in "key" and must
+  // not be treated as one, or the field dies of false positives.
+  test('names that merely end in a credential word are left alone', () => {
+    const f = fragmentOf('psql --monkey business -h db')
+    expect(f).not.toBe(FRAGMENT_REDACTED)
+    expect(fragmentOf('mkdir -p /tmp/x && psql -h db')).not.toBe(FRAGMENT_REDACTED)
+    // docker's uid:gid pair is not basic auth (reviewer NOTE, round 2).
+    expect(fragmentOf('docker run -u 1000:1000 img psql')).not.toBe(FRAGMENT_REDACTED)
+  })
+})
+
+// MUST-2 round 2: `bash_patterns` accept globs, and `*` becomes `.*`, so the
+// match ran to the end of the line and the "16 chars of context" window became
+// the whole command. The window must be bounded by its OWN length, whatever
+// the match swallowed — that way a glob in the policy decides nothing.
+describe('a greedy glob cannot widen the window', () => {
+  const GLOB_POLICY: PermissionPolicy = {
+    default_tier: 'allow',
+    confirm: { bash_patterns: ['runjob*'] },
+  }
+  test('the fragment stays a window, not the line', () => {
+    const tail = '--step one --step two --step three --step four --step five --final marker'
+    const f = fragmentOf(`runjob ${tail}`, GLOB_POLICY)
+    // 16 chars of context on each side plus a bounded slice of the match.
+    expect(f.length).toBeLessThanOrEqual(64)
+    expect(f).toContain('runjob')
+    expect(f).not.toContain('marker')
+  })
+})
+
+// MUST-3 round 2: the decision was taken on the LOWERCASED command whenever a
+// character changed length under toLowerCase. One U+0130 disabled every
+// case-sensitive detector — and the journal then received a lowercased command
+// presented as a verbatim quote.
+describe('a length-changing character cannot disable the case-sensitive rules', () => {
+  const GLOB_POLICY: PermissionPolicy = {
+    default_tier: 'allow',
+    confirm: { bash_patterns: ['runjob*'] },
+  }
+  const DOTTED_I = String.fromCharCode(0x0130) // 'İ' lowercases to two chars
+
+  test('the AWS key shape is caught with and without the dotted I', () => {
+    expect(fragmentOf('runjob AKIAJ7EXAMPLE0KEY', GLOB_POLICY)).toBe(FRAGMENT_REDACTED)
+    expect(fragmentOf(`runjob --note ${DOTTED_I}stanbul AKIAJ7EXAMPLE0KEY`, GLOB_POLICY)).toBe(
+      FRAGMENT_REDACTED,
+    )
+  })
+
+  test('no lowercased copy is ever passed off as a quote', () => {
+    // We cannot locate the match in the raw text once the indices no longer
+    // line up, so there is no fragment to quote. Empty beats a quote that is
+    // quietly not what was typed (`-F` arriving as `-f`).
+    const v = classify('Bash', { command: `psql -F x --note ${DOTTED_I}stanbul` }, OPERATOR_PATTERNS)
+    expect(v.tier).toBe('confirm')
+    expect(v.matchedFragment).toBe('')
+  })
+})
+
+// SHOULD-2 round 2: the cost of scanning the whole command, made visible.
+// These are NOT approvals — they are the price of the trade, named so a
+// regression in usefulness shows up here instead of in the journal.
+describe('cost of the whole-command scan (documented, not endorsed)', () => {
+  test('opaque but harmless identifiers lose their fragment today', () => {
+    const sha40 = 'da39a3ee5e6b4b0d3255bfef95601890afd80709'
+    const uuid = '3f2504e0-4f89-11d3-9a0c-0305e82c3301'
+    const container = '9f2b7c1d4e6a8b0c2d4e6f8a0b2c4d6e'
+    expect(fragmentOf(`psql -c "select 1" -- ${sha40}`)).toBe(FRAGMENT_REDACTED)
+    expect(fragmentOf(`psql --session-note ${uuid}`)).toBe(FRAGMENT_REDACTED)
+    expect(fragmentOf(`docker exec ${container} psql`)).toBe(FRAGMENT_REDACTED)
+  })
+  test('but ordinary work keeps its quote', () => {
+    expect(fragmentOf('cd /srv && psql -h db.internal -c "select 1"')).toContain('psql -h db.internal')
+    const branch = classify(
+      'Bash',
+      { command: 'git push -u origin feature/permission-gate-fragment' },
+      VARIANT1,
+    )
+    expect(branch.matchedFragment).toContain('git push -u origin')
+  })
+})
+
 // MUST-2 (codex): an operator rule label carries the raw pattern from the
 // policy file. A pattern naming a key path is written into an append-only log
 // as-is unless the writer redacts it too.
@@ -1654,8 +1772,23 @@ describe('redactRuleForAudit', () => {
 // entropy/character-class based, so it catches opaque values the name-pattern
 // list has no name for — including ones too short for the 32-char run rule.
 describe('guardFragmentForJournal — the second fence uses a different mechanism', () => {
-  test('a high-entropy token below the pattern thresholds is still refused', () => {
-    expect(guardFragmentForJournal('deploy Xk7-pQ2z_Rm9tLv4Bn8sWc3dJ b')).toBe(FRAGMENT_REDACTED)
+  // Round 2 found both "entropy" cases were decided by the FIRST fence, so
+  // deleting entropy altogether left the suite green. Each value below is
+  // asserted to pass fence one FIRST — that assertion is what makes the second
+  // assertion about entropy mean anything.
+  test('an opaque token that fence one lets through is refused by entropy', () => {
+    // 24 chars, lower+digit only: too short for the 32-char run rule and only
+    // two alphanumeric classes, so the name/shape fence has nothing to say.
+    const value = 'deploy q7x2m9k4z8v3n6b1w5j0t7r2 now'
+    expect(redactFragmentForAudit(value)).not.toBe(FRAGMENT_REDACTED)
+    expect(guardFragmentForJournal(value)).toBe(FRAGMENT_REDACTED)
+  })
+  test('base64 containing slashes is refused by entropy', () => {
+    // The opaque-run scan splits on `/`, which chops this into short pieces;
+    // the entropy scan keeps `/` inside the token and sees it whole.
+    const value = 'deploy aGVsbG8/d29ybGQ/c2VjcmV0/dmFsdWU now'
+    expect(redactFragmentForAudit(value)).not.toBe(FRAGMENT_REDACTED)
+    expect(guardFragmentForJournal(value)).toBe(FRAGMENT_REDACTED)
   })
   test('ordinary command text passes both fences', () => {
     expect(guardFragmentForJournal('git push -u origin docs/restore-lost-rules-20260801')).toBe(

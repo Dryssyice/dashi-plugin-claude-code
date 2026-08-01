@@ -1994,6 +1994,14 @@ function matchAllBashRules(rules: readonly string[], commandLower: string): stri
 /** Chars of command kept on each side of the match — enough to see WHERE in a
  *  compound command the rule fired, small enough not to scoop a whole argv. */
 const FRAGMENT_CONTEXT_CHARS = 16
+/** Most of the MATCH itself that is ever shown. A glob pattern can match to the
+ *  end of the line; without this the window is only as small as the operator's
+ *  patterns happen to be. */
+const FRAGMENT_MATCH_MAX_CHARS = 32
+/** Rule labels get their own, larger cap: a label truncated below the length
+ *  the schema accepts (256) stops matching any line in the policy file, and
+ *  naming the rule is the entire point of the field. */
+const RULE_MAX_CHARS = 256
 /** Hard cap on the stored fragment (glob rules can match a very long span). */
 export const FRAGMENT_MAX_CHARS = 120
 /** Stored instead of the text when the text cannot be shown safely. */
@@ -2026,10 +2034,79 @@ const SECRET_SHAPED_RES: readonly RegExp[] = [
   // `--password hunter2` (value in the NEXT argv word) walked straight past it
   // (reviewer, PR #6). Full names only: a bare `-p` would fire on `mkdir -p`.
   new RegExp(`(?:^|\\s)--?(?:${CREDENTIAL_NAME})\\b(?:[=:]|\\s+)\\S`, 'i'),
-  // Basic auth as a `user:password` pair — in a `-u` flag or inside a URL.
-  /(?:^|\s)--?u(?:ser(?:name)?)?(?:[=:]|\s+)[^\s:/]+:[^\s]/i,
+  // Basic auth as a `user:password` pair — in a `-u` flag or inside a URL. The
+  // lookahead exempts a numeric pair: `docker run -u 1000:1000` is a uid:gid,
+  // not a credential (reviewer NOTE, round 2).
+  /(?:^|\s)--?u(?:ser(?:name)?)?(?:[=:]|\s+)(?![0-9]+:[0-9]+(?:\s|$))[^\s:/]+:[^\s]/i,
   /\/\/[^\s/@:]+:[^\s/@]+@/,
 ]
+
+// Credential NAMES as whole words. Round 1 matched a fixed list exactly, so
+// every ordinary spelling walked past: `--db-password`, `--pw`, `-P`, `PW=`
+// (reviewers, round 2). Entropy cannot cover for this — a human password is
+// short and low-entropy, which is exactly what an entropy rule ignores.
+const CREDENTIAL_WORDS = new Set([
+  'password', 'passwd', 'passphrase', 'pass', 'pw', 'pwd', 'secret', 'token',
+  'key', 'auth', 'apikey', 'apitoken', 'authtoken', 'accesskey', 'accesstoken',
+  'privatekey', 'clientsecret', 'credential', 'credentials', 'otp', 'pin',
+  'totp', 'session', 'sessionid', 'sessionkey', 'cookie', 'bearer',
+])
+
+// Tails that make a COMPOUND name a credential name (`db-password`,
+// `api_token`, `proxy.secret`). Only compounds: matching a bare suffix against
+// the whole name would turn `--monkey` into a key.
+const CREDENTIAL_TAILS = new Set([
+  'password', 'passwd', 'passphrase', 'pass', 'pw', 'pwd', 'secret', 'token',
+  'key', 'apikey', 'otp', 'pin', 'credential', 'credentials', 'auth',
+])
+
+function isCredentialName(rawName: string): boolean {
+  const name = rawName.replace(/^-+/, '').toLowerCase()
+  if (name.length === 0) return false
+  if (CREDENTIAL_WORDS.has(name.replace(/[-_.]/g, ''))) return true
+  const parts = name.split(/[-_.]/).filter((p) => p.length > 0)
+  if (parts.length < 2) return false
+  return CREDENTIAL_TAILS.has(parts[parts.length - 1] as string)
+}
+
+/**
+ * A credential NAME followed by its value, in any of the forms a person types:
+ * `--db-password hunter2`, `--pw=x`, `PW=x`, `-P x`, `login <user> <secret>`.
+ * The value is refused whatever its length or entropy — `--pin 8471` is a
+ * secret and looks like nothing at all.
+ */
+function credentialTokenCarriesValue(text: string): boolean {
+  const tokens = text.split(/\s+/).filter((t) => t.length > 0)
+  for (let i = 0; i < tokens.length; i++) {
+    const tok = tokens[i] as string
+    const next = tokens[i + 1]
+    const nextIsValue = next !== undefined && !next.startsWith('-')
+    // `-P value` is mysql's password flag. CASE-SENSITIVE on purpose: the
+    // lowercase `-p` belongs to `mkdir -p` and `docker run -p 80:80`, and
+    // treating it as a credential would bury the journal in [redacted].
+    if (tok === '-P' && nextIsValue) return true
+    const eq = tok.indexOf('=')
+    if (eq > 0) {
+      const name = tok.slice(0, eq)
+      if (/^-{0,2}[A-Za-z][\w.-]*$/.test(name) && isCredentialName(name) && tok.length > eq + 1) {
+        return true
+      }
+      continue
+    }
+    if (!tok.startsWith('-')) {
+      // `login <user> <secret>`: the verb takes the credential as an operand,
+      // so no flag name is there to recognise. Two operands are required, so a
+      // bare `login` (which prompts interactively) is not touched.
+      if (/^["']?(?:login|signin)["']?$/i.test(tok)) {
+        const operands = tokens.slice(i + 1).filter((t) => !t.startsWith('-'))
+        if (operands.length >= 2) return true
+      }
+      continue
+    }
+    if (isCredentialName(tok) && nextIsValue) return true
+  }
+  return false
+}
 
 /** lower / upper / digit classes present in a token. Symbols deliberately do
  *  NOT count: `restore-lost-rules-20260801` is a branch name, not a key. */
@@ -2076,7 +2153,11 @@ function normalizeForSecretScan(text: string): string {
 /** Does this text carry something that must never reach the journal? */
 export function fragmentIsSecretShaped(text: string): boolean {
   const scanned = normalizeForSecretScan(text)
-  return SECRET_SHAPED_RES.some((re) => re.test(scanned)) || opaqueRunLooksSecret(scanned)
+  return (
+    SECRET_SHAPED_RES.some((re) => re.test(scanned)) ||
+    credentialTokenCarriesValue(scanned) ||
+    opaqueRunLooksSecret(scanned)
+  )
 }
 
 /** Bits per character of a token, for the journal-writer's second fence. */
@@ -2164,7 +2245,8 @@ export function guardFragmentForJournal(fragment: string): string {
  * says WHICH kind of rule fired keeps its whole value.
  */
 export function redactRuleForAudit(rule: string): string {
-  const flat = sanitizeFragmentText(rule)
+  const collapsed = redactableFlatten(rule)
+  const flat = collapsed.length > RULE_MAX_CHARS ? collapsed.slice(0, RULE_MAX_CHARS) : collapsed
   if (flat.length === 0) return ''
   const parts = flat.split(':')
   if (parts.length < 3) return fragmentIsSecretShaped(flat) ? FRAGMENT_REDACTED : flat
@@ -2182,7 +2264,19 @@ function bashFragment(rawCommand: string, commandLower: string, pattern: string)
   // command by those indices would then cut a window we never inspected, and a
   // window nobody inspected is exactly how a token reaches a log. Only trust
   // the raw text when the lengths prove the two strings are still aligned.
-  const source = rawCommand.length === commandLower.length ? rawCommand : commandLower
+  // The DECISION is always taken on the raw command. Round 2 judged the
+  // lowercased copy whenever some character changed length under toLowerCase,
+  // and a single U+0130 therefore switched off every case-sensitive detector
+  // (`AKIA`, `AIza`) plus the mixed-class rule — one character, chosen by
+  // whoever wrote the command, disabling half the guard (reviewer MUST-3).
+  if (fragmentIsSecretShaped(rawCommand)) return FRAGMENT_REDACTED
+  // Past this point we need to CUT the raw text at indices found in the
+  // lowercased one. When toLowerCase changed the length those indices no
+  // longer line up, so there is nothing we can honestly quote: emitting the
+  // lowercased copy would put `-f` in the journal as a verbatim quote of `-F`.
+  // A quote that is quietly not what was typed is worse than no quote.
+  if (rawCommand.length !== commandLower.length) return ''
+  const source = rawCommand
 
   // ORDER IS THE WHOLE POINT (reviewer MUST-1, PR #6). Round 1 cut the window
   // FIRST and judged the cut. The cut broke the word boundary that the
@@ -2192,10 +2286,16 @@ function bashFragment(rawCommand: string, commandLower: string, pattern: string)
   // command, and the window is cut only once that command is known to carry
   // nothing secret. A secret far outside the window now costs the fragment;
   // that is the cheap side of the trade.
-  if (fragmentIsSecretShaped(source)) return FRAGMENT_REDACTED
 
+  // The window is bounded by its OWN length, not by how much the match
+  // swallowed. `bash_patterns` accept globs and `*` compiles to `.*`, so a
+  // pattern like `runjob*` matches to the end of the line and the "16 chars of
+  // context" window silently became the whole command (reviewer MUST-2). With
+  // this clamp a glob in the operator's policy decides nothing about size, and
+  // we do not need to read that policy to know it.
+  const shown = Math.min(hit.length, FRAGMENT_MATCH_MAX_CHARS)
   let from = Math.max(0, hit.index - FRAGMENT_CONTEXT_CHARS)
-  let to = Math.min(source.length, hit.index + hit.length + FRAGMENT_CONTEXT_CHARS)
+  let to = Math.min(source.length, hit.index + shown + FRAGMENT_CONTEXT_CHARS)
   // Keep the window on the line the match is on: a heredoc body otherwise gets
   // dragged in and the fragment stops being a quote of the command.
   const lineStart = source.lastIndexOf('\n', Math.max(0, hit.index - 1))
