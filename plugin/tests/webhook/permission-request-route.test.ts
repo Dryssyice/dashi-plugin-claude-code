@@ -223,6 +223,36 @@ describe('request_created names the rule, the fragment and the cwd', () => {
     expect(created!.matched_fragment).toBe('[redacted]')
   })
 
+  test('a secret-shaped operator pattern is redacted inside the rule label', async () => {
+    // MUST-2 (codex, PR #6): an operator rule label is assembled as
+    // `confirm:bash_patterns:<raw pattern from the policy file>`. The pattern
+    // is operator text and can name a key; the writer must not trust it.
+    const { h } = await start(cfg(), (relay, requestId) => relay.answer(requestId, 'allow'))
+    await fetch(url(h, '/hooks/permission/request'), {
+      method: 'POST',
+      headers: AUTH,
+      body: body({ matched_rule: 'confirm:bash_patterns:AKIAJ7EXAMPLE0KEY' }),
+    })
+    const created = auditLines().find((e) => e.event === 'request_created')
+    expect(String(created!.matched_rule)).not.toContain('AKIAJ7EXAMPLE0KEY')
+    // The KIND of rule survives — that is what makes the record useful.
+    expect(created!.matched_rule).toBe('confirm:bash_patterns:[redacted]')
+  })
+
+  test('the route refuses an opaque token the sender let through', async () => {
+    // The route's guard is a SECOND mechanism, not a second call of the first:
+    // this value has no credential name and is too short for the 32-char run
+    // rule, so only the entropy fence catches it.
+    const { h } = await start(cfg(), (relay, requestId) => relay.answer(requestId, 'allow'))
+    await fetch(url(h, '/hooks/permission/request'), {
+      method: 'POST',
+      headers: AUTH,
+      body: body({ matched_fragment: 'deploy Xk7-pQ2z_Rm9tLv4Bn8sWc3dJ b' }),
+    })
+    const created = auditLines().find((e) => e.event === 'request_created')
+    expect(created!.matched_fragment).toBe('[redacted]')
+  })
+
   test('a request without the new fields still writes a record', async () => {
     const { h } = await start(cfg(), (relay, requestId) => relay.answer(requestId, 'allow'))
     await fetch(url(h, '/hooks/permission/request'), { method: 'POST', headers: AUTH, body: body() })

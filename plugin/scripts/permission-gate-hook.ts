@@ -38,7 +38,6 @@ import { load as parseYaml, JSON_SCHEMA } from 'js-yaml'
 
 import {
   classifyToolCall,
-  redactFragmentForAudit,
   PermissionPolicySchema,
   type PermissionPolicy,
   type PermissionVerdict,
@@ -184,9 +183,13 @@ export function buildConfirmRequest(args: {
     preview: args.preview,
     reason: args.reason,
     matched_rule: args.matchedRule ?? '',
-    // Redact again on the way out: the classifier already did, but this is the
-    // last point the hook controls before the text leaves the process.
-    matched_fragment: redactFragmentForAudit(args.matchedFragment ?? ''),
+    // NOT redacted again here. Round 1 called the classifier's own redactor a
+    // second time on the same bytes; a mutation run proved it: deleting this
+    // call left 415/415 green, because nothing else could ever depend on it.
+    // The classifier decides (it is the only place that still has the whole
+    // command), the journal writer guards independently (it is the only place
+    // that writes the file). A third identical call is not a fence.
+    matched_fragment: args.matchedFragment ?? '',
     cwd: args.cwd ?? '',
     timeout_ms: timeoutMs,
   })

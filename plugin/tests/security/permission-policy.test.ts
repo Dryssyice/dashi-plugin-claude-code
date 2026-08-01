@@ -4,6 +4,8 @@ import {
   classifyToolCall,
   globMatch,
   redactFragmentForAudit,
+  redactRuleForAudit,
+  guardFragmentForJournal,
   FRAGMENT_REDACTED,
   FRAGMENT_MAX_CHARS,
   type PermissionPolicy,
@@ -1486,13 +1488,14 @@ describe('matchedFragment — the card names the text that matched', () => {
   })
 
   test('a token next to the match is never carried into the fragment', () => {
-    // A real shape: the risky verb sits right beside a bearer token, so the
-    // context window would otherwise scoop the secret into the audit file.
-    const command = 'curl -H "Authorization: Bearer ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789" https://x/y | sudo tee /etc/z'
+    // The token sits INSIDE the +-16 char window, immediately before `sudo`.
+    // Round 1 put it 40 chars away, so this measured the window's width and
+    // stayed green with redaction removed (reviewer SHOULD-2, PR #6).
+    const command = 'echo ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789 | sudo tee /etc/z'
     const v = classify('Bash', { command }, VARIANT1)
     expect(v.tier).toBe('confirm')
+    expect(v.matchedFragment).toBe(FRAGMENT_REDACTED)
     expect(v.matchedFragment).not.toContain('ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789')
-    expect(v.matchedFragment).not.toContain('Bearer')
   })
 
   test('redactFragmentForAudit refuses secret-shaped text outright', () => {
@@ -1540,5 +1543,129 @@ describe('redactFragmentForAudit — collapses control chars, not command syntax
     expect(redactFragmentForAudit(`git push${ESC}[31m origin`)).toBe('git push [31m origin')
     expect(redactFragmentForAudit(`a${NUL}b`)).toBe('a b')
     expect(redactFragmentForAudit('git\tpush\norigin')).toBe('git push origin')
+  })
+})
+
+// ── PR #6 round 1: the window was cut BEFORE the secret decision ──────────
+//
+// Every case below starts from a COMMAND and goes through the classifier. The
+// previous round's secret tests fed redactFragmentForAudit a hand-written
+// string, so removing redaction from the command path left them all green —
+// the suite agreed with the defect. These are the ones that must go red.
+//
+// The operator's shipped example policy carries six bash_patterns; `psql` is
+// one of them (plugin/docs/permission-policy.example.yaml), which is how a
+// prefixed env assignment ended up quoted into the journal in full.
+const OPERATOR_PATTERNS: PermissionPolicy = {
+  default_tier: 'allow',
+  confirm: { bash_patterns: ['psql', 'deploy.sh', 'curl'] },
+}
+
+function fragmentOf(command: string, policy: PermissionPolicy = OPERATOR_PATTERNS): string {
+  const v = classify('Bash', { command }, policy)
+  expect(v.tier).toBe('confirm')
+  return v.matchedFragment
+}
+
+describe('the secret decision is made on the whole command, not on the window', () => {
+  test('a prefixed env assignment beside the match never reaches the journal', () => {
+    // The reviewer's reproduction, verbatim in shape: PGPASSWORD=<value> psql.
+    // Cutting +-16 chars first split `PGPASSWORD=` off its own name, so the
+    // `name=value` detector no longer matched while the value stayed whole.
+    const f = fragmentOf('PGPASSWORD=hunter2correcthorse psql -h db.internal -U app')
+    expect(f).toBe(FRAGMENT_REDACTED)
+  })
+
+  test('a secret far outside the window still redacts the whole fragment', () => {
+    // 200 chars away from the match: the window would never have seen it, and
+    // that was the bug — the window decided, so distance meant safety.
+    const far = 'export API_KEY=sk-live_0a1b2c3d4e5f6a7b8c9d ' + ' '.repeat(120) + '&& psql -c "select 1"'
+    expect(fragmentOf(far)).toBe(FRAGMENT_REDACTED)
+  })
+
+  test('flag-form credentials are caught, with and without a separator', () => {
+    expect(fragmentOf('psql --password hunter2correct -h db')).toBe(FRAGMENT_REDACTED)
+    expect(fragmentOf('curl -u admin:s3cr3tvalue https://api.example/x')).toBe(FRAGMENT_REDACTED)
+    expect(fragmentOf('curl https://user:p4ssw0rd@api.example/x')).toBe(FRAGMENT_REDACTED)
+    expect(fragmentOf('curl --header "X-Api-Key: 8f3b1c9d2e4a6b8c" https://x/y')).toBe(FRAGMENT_REDACTED)
+  })
+
+  test('base64 survives the character class that broke the plain run rule', () => {
+    // `+`, `/` and `=` split the [A-Za-z0-9_-]{32,} run into short pieces.
+    const blob = 'aGVsbG8gd29ybGQgc2VjcmV0IHZhbHVlIGhlcmU+Pz8/'
+    expect(fragmentOf(`curl -d ${blob} https://x/y`)).toBe(FRAGMENT_REDACTED)
+  })
+
+  test('a heredoc body is scanned too, not just the line of the match', () => {
+    const cmd = "psql -f - <<'SQL'\n-- deploy token: ghp_QqWwEeRrTtYyUuIiOoPp0123456789\nSQL"
+    expect(fragmentOf(cmd)).toBe(FRAGMENT_REDACTED)
+  })
+
+  test('zero-width and fullwidth characters cannot hide the credential name', () => {
+    const ZWSP = String.fromCharCode(0x200b)
+    const FULLWIDTH_COLON = String.fromCharCode(0xff1a)
+    expect(fragmentOf(`curl -H "bearer${ZWSP} tOkEnValue12345678" https://x`)).toBe(FRAGMENT_REDACTED)
+    expect(fragmentOf(`curl -H "token${FULLWIDTH_COLON} tOkEnValue12345678" https://x`)).toBe(FRAGMENT_REDACTED)
+  })
+
+  // NEGATIVE CONTROL. Redacting everything would pass every test above and be
+  // useless: the point of the field is to quote the command. These must keep
+  // their text — including the operator's own branch name, a 32-char run.
+  test('ordinary commands keep a readable fragment', () => {
+    const f = fragmentOf('cd /srv && psql -h db.internal -c "select count(*) from users" -o /tmp/out')
+    expect(f).toContain('psql -h db.internal')
+    expect(f).not.toBe(FRAGMENT_REDACTED)
+
+    const push = classify(
+      'Bash',
+      { command: 'git push -u origin docs/restore-lost-rules-20260801' },
+      VARIANT1,
+    )
+    expect(push.matchedFragment).toContain('git push -u origin')
+    expect(push.matchedFragment).not.toBe(FRAGMENT_REDACTED)
+  })
+
+  test('the window never crosses a newline', () => {
+    const cmd = 'echo first line here\npsql -h db\necho third line here'
+    const f = fragmentOf(cmd)
+    expect(f).toContain('psql -h db')
+    expect(f).not.toContain('first line')
+    expect(f).not.toContain('third line')
+  })
+})
+
+// MUST-2 (codex): an operator rule label carries the raw pattern from the
+// policy file. A pattern naming a key path is written into an append-only log
+// as-is unless the writer redacts it too.
+describe('redactRuleForAudit', () => {
+  test('built-in and ordinary operator rules pass through', () => {
+    expect(redactRuleForAudit('builtin:confirm_bash:git push')).toBe('builtin:confirm_bash:git push')
+    expect(redactRuleForAudit('confirm:bash_patterns:deploy.sh')).toBe('confirm:bash_patterns:deploy.sh')
+    expect(redactRuleForAudit('default:allow')).toBe('default:allow')
+  })
+  test('a secret-shaped pattern loses the pattern, not the rule kind', () => {
+    const out = redactRuleForAudit('confirm:bash_patterns:AKIAJ7EXAMPLE0KEY')
+    expect(out).toBe(`confirm:bash_patterns:${FRAGMENT_REDACTED}`)
+    expect(out).not.toContain('AKIAJ7EXAMPLE0KEY')
+  })
+})
+
+// MUST-1, last clause: the route's guard must be an INDEPENDENT check. It is
+// entropy/character-class based, so it catches opaque values the name-pattern
+// list has no name for — including ones too short for the 32-char run rule.
+describe('guardFragmentForJournal — the second fence uses a different mechanism', () => {
+  test('a high-entropy token below the pattern thresholds is still refused', () => {
+    expect(guardFragmentForJournal('deploy Xk7-pQ2z_Rm9tLv4Bn8sWc3dJ b')).toBe(FRAGMENT_REDACTED)
+  })
+  test('ordinary command text passes both fences', () => {
+    expect(guardFragmentForJournal('git push -u origin docs/restore-lost-rules-20260801')).toBe(
+      'git push -u origin docs/restore-lost-rules-20260801',
+    )
+    expect(guardFragmentForJournal('psql -h db.internal -U app_service_account')).toBe(
+      'psql -h db.internal -U app_service_account',
+    )
+  })
+  test('it still catches what the pattern fence catches', () => {
+    expect(guardFragmentForJournal('export TOKEN=sk-live_9f2b7c1d4e6a8b0c2d4e')).toBe(FRAGMENT_REDACTED)
   })
 })

@@ -2004,6 +2004,12 @@ export const FRAGMENT_REDACTED = '[redacted]'
 // hard-deny above and never reaches a confirm card, but an inline token in an
 // otherwise legitimate command does. Matching is shape-based on purpose — the
 // audit writer must not need to know which vendor issued the token.
+// Credential NAMES, in one string so the `name=value` form and the flag form
+// (`--password secret`) cannot drift apart.
+const CREDENTIAL_NAME =
+  'password|passwd|passphrase|secret|token|api[_-]?key|apikey|access[_-]?key|' +
+  'auth[_-]?token|private[_-]?key|client[_-]?secret|credential'
+
 const SECRET_SHAPED_RES: readonly RegExp[] = [
   /-----BEGIN[ A-Z]*PRIVATE KEY/i,
   // Vendor-prefixed keys: OpenAI/Stripe sk-/pk-/rk-, GitHub, Slack, AWS, Google.
@@ -2014,27 +2020,156 @@ const SECRET_SHAPED_RES: readonly RegExp[] = [
   /\bAIza[0-9A-Za-z_-]{10,}/,
   // A credential NAME immediately followed by its value. The name alone is
   // harmless prose ("rotate the token"); `name=`/`name:` means a value follows.
-  /\b(?:bearer|token|secret|password|passwd|api[_-]?key|access[_-]?key|auth[_-]?token|private[_-]?key)\b\s*[:=]/i,
+  new RegExp(`\\b(?:${CREDENTIAL_NAME}|bearer)\\b\\s*[:=]`, 'i'),
   /\bbearer\s+\S/i,
-  // A long opaque run with no separators is a credential whatever issued it.
-  // 32 is above ordinary identifiers/branch names and below real key lengths.
-  /(?<![A-Za-z0-9_-])[A-Za-z0-9_-]{32,}(?![A-Za-z0-9_-])/,
+  // FLAG form. The rule above needs `:`/`=` right after the name, so
+  // `--password hunter2` (value in the NEXT argv word) walked straight past it
+  // (reviewer, PR #6). Full names only: a bare `-p` would fire on `mkdir -p`.
+  new RegExp(`(?:^|\\s)--?(?:${CREDENTIAL_NAME})\\b(?:[=:]|\\s+)\\S`, 'i'),
+  // Basic auth as a `user:password` pair — in a `-u` flag or inside a URL.
+  /(?:^|\s)--?u(?:ser(?:name)?)?(?:[=:]|\s+)[^\s:/]+:[^\s]/i,
+  /\/\/[^\s/@:]+:[^\s/@]+@/,
 ]
 
+/** lower / upper / digit classes present in a token. Symbols deliberately do
+ *  NOT count: `restore-lost-rules-20260801` is a branch name, not a key. */
+function alnumClassCount(token: string): number {
+  return (/[a-z]/.test(token) ? 1 : 0) + (/[A-Z]/.test(token) ? 1 : 0) + (/[0-9]/.test(token) ? 1 : 0)
+}
+
 /**
- * Make one fragment safe to append to the audit JSONL, or refuse it whole.
- * Whitespace (including the newlines of a heredoc) is collapsed first: a raw
- * newline would split one JSONL record into two and corrupt every reader.
+ * An opaque encoded run. A plain `[A-Za-z0-9_-]{32,}` rule missed base64
+ * outright: `+`, `/` and `=` are not in that class, so one blob read as several
+ * short tokens (reviewer, PR #6). Split on characters that never appear INSIDE
+ * an encoded credential, then judge each piece.
+ */
+function opaqueRunLooksSecret(text: string): boolean {
+  for (const token of text.split(/[^A-Za-z0-9+=_-]+/)) {
+    if (token.length >= 32 && /^[A-Za-z0-9_-]+$/.test(token)) return true
+    // Mixed case AND digits over a long run is machine-generated, not prose.
+    if (token.length >= 24 && alnumClassCount(token) === 3) return true
+    // Base64 padding gives it away on its own, at a lower length.
+    if (token.length >= 16 && /^[A-Za-z0-9+]+={1,2}$/.test(token)) return true
+  }
+  return false
+}
+
+// Characters that render as nothing. `bearer<ZWSP> value` hid the credential
+// name from the detector until these were removed before the scan.
+const ZERO_WIDTH_RE = /[\u00ad\u200b-\u200f\u2060\ufeff]/g
+
+/**
+ * Fold text into the form the detectors are written against, for the DECISION
+ * only — what gets stored stays as the operator typed it. NFKC maps fullwidth
+ * punctuation onto ASCII, so `token：value` can no longer hide from `name:`.
+ */
+function normalizeForSecretScan(text: string): string {
+  let folded: string
+  try {
+    folded = text.normalize('NFKC')
+  } catch {
+    folded = text // exotic input: scan it unfolded rather than skip the scan
+  }
+  return folded.replace(ZERO_WIDTH_RE, '')
+}
+
+/** Does this text carry something that must never reach the journal? */
+export function fragmentIsSecretShaped(text: string): boolean {
+  const scanned = normalizeForSecretScan(text)
+  return SECRET_SHAPED_RES.some((re) => re.test(scanned)) || opaqueRunLooksSecret(scanned)
+}
+
+/** Bits per character of a token, for the journal-writer's second fence. */
+const ENTROPY_MIN_TOKEN_CHARS = 24
+const ENTROPY_BITS_THRESHOLD = 4.0
+
+function shannonBits(token: string): number {
+  const counts = new Map<string, number>()
+  for (const ch of token) counts.set(ch, (counts.get(ch) ?? 0) + 1)
+  let bits = 0
+  for (const n of counts.values()) {
+    const p = n / token.length
+    bits -= p * Math.log2(p)
+  }
+  return bits
+}
+
+function highEntropyToken(text: string): boolean {
+  for (const token of text.split(/[^A-Za-z0-9+/=_-]+/)) {
+    if (token.length < ENTROPY_MIN_TOKEN_CHARS) continue
+    // A single alphanumeric class (a long number, a repeated letter) is
+    // repetition, not a secret; two keeps prose and paths out.
+    if (alnumClassCount(token) < 2) continue
+    if (shannonBits(token) >= ENTROPY_BITS_THRESHOLD) return true
+  }
+  return false
+}
+
+/**
+ * Zero-width characters out, control characters and whitespace runs collapsed
+ * to one space. The class is control-characters-plus-space and DEL; it must
+ * NOT include the hyphen -- `git reset --hard` written to the journal as
+ * `git reset hard` reads as a quote of the command while being a different
+ * command.
+ */
+function redactableFlatten(text: string): string {
+  return text
+    .replace(ZERO_WIDTH_RE, '')
+    .replace(/[\u0000-\u0020\u007f]+/g, ' ')
+    .trim()
+}
+
+/**
+ * FIRST fence (classifier side): name-and-shape based. Refuses the whole text
+ * when any known credential shape appears anywhere in it. Whitespace and
+ * control characters are collapsed first: a raw newline would split one JSONL
+ * record into two and corrupt every reader.
  */
 export function redactFragmentForAudit(fragment: string): string {
-  // Collapse control characters and whitespace runs into one space.
-  // \u0000-\u0020 is every control char plus space, \u007f is DEL. It must NOT
-  // include the hyphen: `git reset --hard` logged as `git reset hard` reads as
-  // a quote of the command while being a different command (found in review).
-  const flat = fragment.replace(/[\u0000-\u0020\u007f]+/g, ' ').trim()
-  if (flat.length === 0) return ''
-  if (SECRET_SHAPED_RES.some((re) => re.test(flat))) return FRAGMENT_REDACTED
+  // Collapse first so the stored text is one JSONL-safe line.
+  const flat = redactableFlatten(fragment)
+  const capped = flat.length > FRAGMENT_MAX_CHARS ? flat.slice(0, FRAGMENT_MAX_CHARS) : flat
+  if (capped.length === 0) return ''
+  // Decide on the ORIGINAL text, never on the collapsed-and-capped copy: the
+  // cut is what broke the `name=value` word boundary in round 1.
+  return fragmentIsSecretShaped(fragment) ? FRAGMENT_REDACTED : capped
+}
+
+/** Zero-width characters and control characters out, whitespace runs collapsed,
+ *  length capped. Must NOT touch the hyphen: `git reset --hard` logged as
+ *  `git reset hard` reads as a quote while being a different command. */
+function sanitizeFragmentText(text: string): string {
+  const flat = redactableFlatten(text)
   return flat.length > FRAGMENT_MAX_CHARS ? flat.slice(0, FRAGMENT_MAX_CHARS) : flat
+}
+
+/**
+ * SECOND fence (journal-writer side), deliberately a DIFFERENT mechanism:
+ * Shannon entropy over long tokens instead of a list of known names. Two copies
+ * of one denylist are one fence, not two — this one catches opaque values that
+ * no name introduces and that are too short for the 32-char run rule. It
+ * over-refuses, which is the right side to fail on.
+ */
+export function guardFragmentForJournal(fragment: string): string {
+  const first = redactFragmentForAudit(fragment)
+  if (first === FRAGMENT_REDACTED || first.length === 0) return first
+  return highEntropyToken(normalizeForSecretScan(fragment)) ? FRAGMENT_REDACTED : first
+}
+
+/**
+ * A rule label is `<tier>:<kind>:<pattern>`, and for operator rules the pattern
+ * is text straight from the policy file — a pattern naming a key would be
+ * copied into an append-only log verbatim (codex, PR #6). Tier and kind are
+ * ours and always safe, so only the pattern is dropped: a record that still
+ * says WHICH kind of rule fired keeps its whole value.
+ */
+export function redactRuleForAudit(rule: string): string {
+  const flat = sanitizeFragmentText(rule)
+  if (flat.length === 0) return ''
+  const parts = flat.split(':')
+  if (parts.length < 3) return fragmentIsSecretShaped(flat) ? FRAGMENT_REDACTED : flat
+  const pattern = parts.slice(2).join(':')
+  return fragmentIsSecretShaped(pattern) ? `${parts[0]}:${parts[1]}:${FRAGMENT_REDACTED}` : flat
 }
 
 /** The command window around a bash-pattern match, redacted. '' when the
@@ -2048,16 +2183,26 @@ function bashFragment(rawCommand: string, commandLower: string, pattern: string)
   // window nobody inspected is exactly how a token reaches a log. Only trust
   // the raw text when the lengths prove the two strings are still aligned.
   const source = rawCommand.length === commandLower.length ? rawCommand : commandLower
-  const from = Math.max(0, hit.index - FRAGMENT_CONTEXT_CHARS)
-  const to = Math.min(source.length, hit.index + hit.length + FRAGMENT_CONTEXT_CHARS)
-  // Widest first, then the bare match. The context is what makes a fragment
-  // worth logging, but it is also the part that can carry a credential; when it
-  // does, the match alone still beats dropping everything.
-  for (const candidate of [source.slice(from, to), source.slice(hit.index, hit.index + hit.length)]) {
-    const safe = redactFragmentForAudit(candidate)
-    if (safe !== FRAGMENT_REDACTED && safe.length > 0) return safe
-  }
-  return FRAGMENT_REDACTED
+
+  // ORDER IS THE WHOLE POINT (reviewer MUST-1, PR #6). Round 1 cut the window
+  // FIRST and judged the cut. The cut broke the word boundary that the
+  // `name=value` detector needs -- `PGPASSWORD=` lost its own name to the left
+  // edge while the value stayed whole inside the window -- and the value was
+  // written to the journal in full. So the decision is made on the ENTIRE
+  // command, and the window is cut only once that command is known to carry
+  // nothing secret. A secret far outside the window now costs the fragment;
+  // that is the cheap side of the trade.
+  if (fragmentIsSecretShaped(source)) return FRAGMENT_REDACTED
+
+  let from = Math.max(0, hit.index - FRAGMENT_CONTEXT_CHARS)
+  let to = Math.min(source.length, hit.index + hit.length + FRAGMENT_CONTEXT_CHARS)
+  // Keep the window on the line the match is on: a heredoc body otherwise gets
+  // dragged in and the fragment stops being a quote of the command.
+  const lineStart = source.lastIndexOf('\n', Math.max(0, hit.index - 1))
+  if (lineStart >= from) from = lineStart + 1
+  const lineEnd = source.indexOf('\n', hit.index + hit.length)
+  if (lineEnd !== -1 && lineEnd < to) to = lineEnd
+  return sanitizeFragmentText(source.slice(from, to))
 }
 
 // rulesMatch reports a LABELLED hit (`bash_patterns:<pat>`, `tools:<glob>`,

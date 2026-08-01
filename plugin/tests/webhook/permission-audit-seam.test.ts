@@ -140,14 +140,16 @@ describe('command -> hook -> route -> journal', () => {
   })
 
   test('a structural rule names itself and quotes nothing', async () => {
-    // The 31.07 card: a heredoc body with an odd number of apostrophes leaves
-    // the quote-aware scanner unable to tokenize, so it fails closed. Nothing
-    // "matched" — the fragment must stay empty rather than invent a quote.
-    const line = await walk(
-      "git commit -q -F - <<'MSG'\nthe operator's rules, the operator's file, the operator's own\nMSG\n&& git push -u origin docs/x",
-      '/srv/worktrees/lost-rules',
-    )
-    expect(String(line.matched_rule)).toContain('builtin:confirm_bash:')
+    // Round 1 used a command that ALSO contained `git push`, so the built-in
+    // substring rule answered first and the structural detector was never
+    // reached — the test asserted nothing about matched_fragment either
+    // (reviewer SHOULD-3, PR #6). `git -c core.sshCommand=` trips only the
+    // exec-surface parse: no substring from BUILTIN_CONFIRM_BASH appears.
+    const line = await walk('git -c core.sshcommand=/tmp/evil.sh status', '/srv/worktrees/lost-rules')
+    expect(line.matched_rule).toBe('builtin:confirm_bash:git-exec-surface')
+    // A parse has no matching substring to quote. An invented one would read
+    // as evidence in the journal, so the field must stay empty.
+    expect(line.matched_fragment).toBe('')
     expect(line.cwd).toBe('/srv/worktrees/lost-rules')
   })
 })

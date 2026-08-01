@@ -10,7 +10,7 @@ import type { StatePaths } from '../../config.js'
 import { resolvePermissionGateAllowedUserIds } from '../../config.js'
 import type { Logger } from '../../log.js'
 import { PermissionRequestRouteSchema, type PermissionRequestRoute } from '../../schemas.js'
-import { redactFragmentForAudit } from '../../security/permission-policy.js'
+import { guardFragmentForJournal, redactRuleForAudit } from '../../security/permission-policy.js'
 import type { WebhookDeps } from '../server.js'
 import { authGate, readJsonBody, reply } from './shared.js'
 
@@ -138,11 +138,16 @@ export async function handlePermissionRequest(
       // Which rule raised the card, and the text it matched. Without these the
       // record said only "a card appeared", and the rule had to be re-derived
       // by hand every time (six days of it, 2026-08-01).
-      matched_rule: payload.matched_rule,
-      // Redacted HERE as well as in the hook: this function is what writes the
-      // file, so the "no secret in the journal" guarantee has to hold at the
-      // write, not only at the sender we happen to trust today.
-      matched_fragment: redactFragmentForAudit(payload.matched_fragment),
+      // The rule label ends in the operator's own pattern from the policy file
+      // (`confirm:bash_patterns:<pattern>`), so it is untrusted text too — a
+      // pattern naming a key would otherwise be copied here verbatim (codex).
+      matched_rule: redactRuleForAudit(payload.matched_rule),
+      // The guard here is a DIFFERENT mechanism from the classifier's (entropy
+      // over long tokens, not a list of credential names). Re-running the same
+      // check on the same bytes would be one fence spelled twice; this one can
+      // refuse what the first had no name for, and this function is the one
+      // that writes the file.
+      matched_fragment: guardFragmentForJournal(payload.matched_fragment),
       // The working directory of the call: two worktrees of one repository
       // produce byte-identical git author/committer, so the object alone cannot
       // say which tree acted.
