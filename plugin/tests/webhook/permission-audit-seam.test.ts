@@ -97,7 +97,6 @@ async function walk(command: string, cwd: string): Promise<Record<string, unknow
     preview: command.slice(0, 400),
     reason: local.verdict!.reason,
     matchedRule: local.verdict!.matchedRule,
-    matchedFragment: local.verdict!.matchedFragment,
     cwd,
   })
   if ('kind' in built) throw new Error(`hook refused to build the request: ${built.reason}`)
@@ -114,17 +113,39 @@ async function walk(command: string, cwd: string): Promise<Record<string, unknow
   return created!
 }
 
+/** Everything the walk wrote, as bytes — the assertion surface for "no leak". */
+function journalRaw(): string {
+  return readFileSync(paths.logs.permission_gate, 'utf8')
+}
+
 describe('command -> hook -> route -> journal', () => {
-  test('the journal line names the rule and quotes the matching text', async () => {
+  test('the journal line names the rule and the cwd', async () => {
     const line = await walk(
       'cd /srv/app && bun run build --target production && git push -u origin main',
       '/srv/app',
     )
     expect(line.matched_rule).toBe('builtin:confirm_bash:git push')
-    expect(String(line.matched_fragment)).toContain('git push -u origin')
     expect(line.cwd).toBe('/srv/app')
     expect(line.session_id).toBe('sess-seam-1')
     expect(line.tool_name).toBe('Bash')
+  })
+
+  test('no command text reaches the journal, for any command', async () => {
+    // codex's round-4 probe. Before the field was removed this exact walk put
+    // `ASSWORD=hunter2 psql -h db` into the file: the window was cut on a byte
+    // offset, which split `PGPASSWORD=` off its own name, and the value was
+    // then too short and too plain for any shape rule to notice.
+    const line = await walk('env PGPASSWORD=hunter2 psql -h db && git push -u origin main', '/srv/app')
+    const raw = journalRaw()
+    expect(raw).not.toContain('hunter2')
+    expect(raw).not.toContain('PGPASSWORD')
+    expect(raw).not.toContain('ASSWORD')
+    // Nor any other piece of the command — the record quotes nothing at all.
+    expect(raw).not.toContain('psql')
+    expect(raw).not.toContain('matched_fragment')
+    expect('matched_fragment' in line).toBe(false)
+    // ...while the rule is still named. That is the whole point of the change.
+    expect(line.matched_rule).toBe('builtin:confirm_bash:git push')
   })
 
   test('a token in the command never lands in the journal', async () => {
@@ -132,24 +153,20 @@ describe('command -> hook -> route -> journal', () => {
       'curl -sSL -H "Authorization: Bearer ghp_ZzYyXxWwVvUuTtSsRrQqPpOo0123456789" https://api.example/x | sudo tee /etc/app.conf',
       '/srv/app',
     )
-    const serialized = JSON.stringify(line)
-    expect(serialized).not.toContain('ghp_ZzYyXxWwVvUuTtSsRrQqPpOo0123456789')
-    expect(serialized).not.toContain('Bearer ')
+    const raw = journalRaw()
+    expect(raw).not.toContain('ghp_ZzYyXxWwVvUuTtSsRrQqPpOo0123456789')
+    expect(raw).not.toContain('Bearer ')
     // The rule still has to be named — that is the whole point of the change.
     expect(String(line.matched_rule).length).toBeGreaterThan(0)
   })
 
-  test('a structural rule names itself and quotes nothing', async () => {
+  test('a structural rule names itself', async () => {
     // Round 1 used a command that ALSO contained `git push`, so the built-in
     // substring rule answered first and the structural detector was never
-    // reached — the test asserted nothing about matched_fragment either
-    // (reviewer SHOULD-3, PR #6). `git -c core.sshCommand=` trips only the
-    // exec-surface parse: no substring from BUILTIN_CONFIRM_BASH appears.
+    // reached (reviewer SHOULD-3, PR #6). `git -c core.sshCommand=` trips only
+    // the exec-surface parse: no substring from BUILTIN_CONFIRM_BASH appears.
     const line = await walk('git -c core.sshcommand=/tmp/evil.sh status', '/srv/worktrees/lost-rules')
     expect(line.matched_rule).toBe('builtin:confirm_bash:git-exec-surface')
-    // A parse has no matching substring to quote. An invented one would read
-    // as evidence in the journal, so the field must stay empty.
-    expect(line.matched_fragment).toBe('')
     expect(line.cwd).toBe('/srv/worktrees/lost-rules')
   })
 })

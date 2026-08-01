@@ -178,7 +178,7 @@ describe('POST /hooks/permission/request', () => {
 // appeared. The rule name was computed in the hook and dropped on the way
 // here, so every card cost a manual re-derivation. A function-level test would
 // not have caught it: the name was always correct where it was computed.
-describe('request_created names the rule, the fragment and the cwd', () => {
+describe('request_created names the rule and the cwd — and no command text', () => {
   function auditLines(): Array<Record<string, unknown>> {
     return readFileSync(paths.logs.permission_gate, 'utf8')
       .trim()
@@ -186,29 +186,29 @@ describe('request_created names the rule, the fragment and the cwd', () => {
       .map((l) => JSON.parse(l) as Record<string, unknown>)
   }
 
-  test('rule, fragment and cwd reach the journal', async () => {
+  test('rule and cwd reach the journal', async () => {
     const { h } = await start(cfg(), (relay, requestId) => relay.answer(requestId, 'allow'))
     await fetch(url(h, '/hooks/permission/request'), {
       method: 'POST',
       headers: AUTH,
       body: body({
         matched_rule: 'builtin:confirm_bash:git push',
-        matched_fragment: 'app && git push -u origin main',
         cwd: '/srv/worktrees/feature-x',
       }),
     })
     const created = auditLines().find((e) => e.event === 'request_created')
     expect(created).toBeDefined()
     expect(created!.matched_rule).toBe('builtin:confirm_bash:git push')
-    expect(created!.matched_fragment).toBe('app && git push -u origin main')
     // Two worktrees of one repo produce byte-identical author/committer, so the
     // git object cannot say which tree acted. The cwd can.
     expect(created!.cwd).toBe('/srv/worktrees/feature-x')
   })
 
-  test('a token-shaped fragment is redacted by the writer, not trusted', async () => {
-    // Defence in depth: the hook redacts too, but the route is what writes the
-    // file, so the guarantee has to hold at the write.
+  test('the record has no command-text field at all', async () => {
+    // Not "the field is empty" — the field is gone. An older hook may still be
+    // on disk and still POST `matched_fragment`; the schema is not .strict(),
+    // so the key is accepted and dropped rather than 400-ing the request. What
+    // must not happen is it reaching the file.
     const { h } = await start(cfg(), (relay, requestId) => relay.answer(requestId, 'allow'))
     await fetch(url(h, '/hooks/permission/request'), {
       method: 'POST',
@@ -219,8 +219,12 @@ describe('request_created names the rule, the fragment and the cwd', () => {
       }),
     })
     const created = auditLines().find((e) => e.event === 'request_created')
-    expect(String(created!.matched_fragment)).not.toContain('ghp_AbCdEfGhIjKlMnOpQrStUvWx0123456789')
-    expect(created!.matched_fragment).toBe('[redacted]')
+    expect(created).toBeDefined()
+    expect('matched_fragment' in created!).toBe(false)
+    const raw = readFileSync(paths.logs.permission_gate, 'utf8')
+    expect(raw).not.toContain('matched_fragment')
+    expect(raw).not.toContain('ghp_AbCdEfGhIjKlMnOpQrStUvWx0123456789')
+    expect(raw).not.toContain('Authorization')
   })
 
   test('a secret-shaped operator pattern is redacted inside the rule label', async () => {
@@ -239,25 +243,11 @@ describe('request_created names the rule, the fragment and the cwd', () => {
     expect(created!.matched_rule).toBe('confirm:bash_patterns:[redacted]')
   })
 
-  test('the route refuses an opaque token the sender let through', async () => {
-    // The route's guard is a SECOND mechanism, not a second call of the first:
-    // this value has no credential name and is too short for the 32-char run
-    // rule, so only the entropy fence catches it.
-    const { h } = await start(cfg(), (relay, requestId) => relay.answer(requestId, 'allow'))
-    await fetch(url(h, '/hooks/permission/request'), {
-      method: 'POST',
-      headers: AUTH,
-      body: body({ matched_fragment: 'deploy Xk7-pQ2z_Rm9tLv4Bn8sWc3dJ b' }),
-    })
-    const created = auditLines().find((e) => e.event === 'request_created')
-    expect(created!.matched_fragment).toBe('[redacted]')
-  })
-
   test('a request without the new fields still writes a record', async () => {
     const { h } = await start(cfg(), (relay, requestId) => relay.answer(requestId, 'allow'))
     await fetch(url(h, '/hooks/permission/request'), { method: 'POST', headers: AUTH, body: body() })
     const created = auditLines().find((e) => e.event === 'request_created')
     expect(created!.matched_rule).toBe('')
-    expect(created!.matched_fragment).toBe('')
+    expect(created!.cwd).toBe('')
   })
 })

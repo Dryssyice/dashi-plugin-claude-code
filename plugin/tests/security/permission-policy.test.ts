@@ -3,12 +3,9 @@ import { describe, expect, test } from 'bun:test'
 import {
   classifyToolCall,
   globMatch,
-  redactFragmentForAudit,
   redactRuleForAudit,
-  guardFragmentForJournal,
+  fragmentIsSecretShaped,
   FRAGMENT_REDACTED,
-  FRAGMENT_NOT_QUOTED,
-  FRAGMENT_MAX_CHARS,
   type PermissionPolicy,
   PermissionPolicySchema,
 } from '../../src/security/permission-policy.js'
@@ -1457,350 +1454,57 @@ describe('git-exec-surface round-13 — config family is POSITION/SUBCOMMAND gat
   })
 })
 
-// ── the verdict names its rule AND the text that matched (2026-08-01) ──────
+// ── the verdict names its rule, and nothing else (2026-08-01) ─────────────
 //
-// The gate's audit log recorded `request_created` with no rule name and no
-// matched text, so every card cost a manual re-derivation of "what fired?".
-// The rule name was already computed; the matched TEXT existed nowhere —
-// matchBashRules returned the pattern, never the position it hit.
-describe('matchedFragment — the card names the text that matched', () => {
-  test('built-in confirm substring rule reports the matching text', () => {
+// The card used to be anonymous: `request_created` recorded that a card
+// appeared, not what raised it. The rule name closes that.
+//
+// It does NOT quote the command. A `matchedFragment` field lived on this
+// interface for four review rounds; each round found another way to walk a
+// credential past its redaction (exact names, prefixed names, quoted names,
+// one-word names, an assignment glued to a shell operator), so the field was
+// removed rather than guarded a fifth time. See the block comment on
+// PermissionVerdict.
+describe('the verdict names its rule', () => {
+  test('built-in confirm substring rule', () => {
     const command =
       'cd /srv/app && bun run build --target production && git push -u origin main && echo done'
     const v = classify('Bash', { command }, VARIANT1)
     expect(v.tier).toBe('confirm')
     expect(v.matchedRule).toBe('builtin:confirm_bash:git push')
-    // The fragment is the matched pattern plus its immediate surroundings —
-    // enough to see WHERE in a compound command the rule fired. The dashes of
-    // `-u` must survive: a fragment is a quote of the command or it is nothing.
-    expect(v.matchedFragment).toContain('git push -u origin')
-    expect(v.matchedFragment.length).toBeLessThanOrEqual(FRAGMENT_MAX_CHARS)
-    // Not the whole command: a fragment that is just the command again is no
-    // better than the preview we already log.
-    expect(v.matchedFragment).not.toBe(command)
-    expect(v.matchedFragment).not.toContain('bun run build')
   })
 
-  test('operator confirm bash_pattern reports the matching text too', () => {
+  test('operator confirm bash_pattern', () => {
     const v = classify('Bash', { command: 'bash ops/deploy.sh --prod' }, VARIANT1)
     expect(v.tier).toBe('confirm')
     expect(v.matchedRule).toBe('confirm:bash_patterns:deploy.sh')
-    expect(v.matchedFragment).toContain('deploy.sh')
   })
 
-  test('a token next to the match is never carried into the fragment', () => {
-    // The token sits INSIDE the +-16 char window, immediately before `sudo`.
-    // Round 1 put it 40 chars away, so this measured the window's width and
-    // stayed green with redaction removed (reviewer SHOULD-2, PR #6).
-    const command = 'echo ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789 | sudo tee /etc/z'
-    const v = classify('Bash', { command }, VARIANT1)
-    expect(v.tier).toBe('confirm')
-    expect(v.matchedFragment).toBe(FRAGMENT_REDACTED)
-    expect(v.matchedFragment).not.toContain('ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789')
-  })
-
-  test('redactFragmentForAudit refuses secret-shaped text outright', () => {
-    expect(redactFragmentForAudit('git push origin main')).toBe('git push origin main')
-    expect(redactFragmentForAudit('export TOKEN=sk-live_9f2b7c1d4e6a8b0c2d4e')).toBe(FRAGMENT_REDACTED)
-    expect(redactFragmentForAudit('-----BEGIN OPENSSH PRIVATE KEY-----')).toBe(FRAGMENT_REDACTED)
-    expect(redactFragmentForAudit('psql "password=hunter2"')).toBe(FRAGMENT_REDACTED)
-    // A long opaque run is treated as a credential even without a known prefix.
-    expect(redactFragmentForAudit('deploy A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7')).toBe(FRAGMENT_REDACTED)
-    // Newlines would break the JSONL record into two; collapse, do not drop.
-    expect(redactFragmentForAudit('git\n  push')).toBe('git push')
-  })
-
-  test('structural rules carry no fragment — they match no literal text', () => {
-    // git-exec-surface is a parse, not a pattern: on an unparseable command it
-    // fails closed without any substring having "matched". An invented
-    // fragment here would be a guess dressed as evidence.
+  test('structural rules name themselves too', () => {
     const v = classify('Bash', { command: 'git -c core.sshcommand=evil push' }, VARIANT1)
     expect(v.matchedRule).toContain('git-exec-surface')
-    expect(v.matchedFragment).toBe('')
   })
 
-  test('every verdict carries the field, even when empty', () => {
-    expect(classify('Read', { file_path: '/tmp/a.ts' }, VARIANT1).matchedFragment).toBe('')
-    expect(classify('Bash', { command: 'ls -la' }, VARIANT2).matchedFragment).toBe('')
-  })
-})
-
-// The fragment must stay a QUOTE of the command. A collapse class that eats
-// hyphens turns `git reset --hard` into `git reset hard`: still readable, no
-// longer evidence, and wrong in exactly the flags that decide how bad the
-// command was.
-describe('redactFragmentForAudit — collapses control chars, not command syntax', () => {
-  test('flags keep their dashes', () => {
-    expect(redactFragmentForAudit('git reset --hard HEAD~1')).toBe('git reset --hard HEAD~1')
-    expect(redactFragmentForAudit('rm -rf --no-preserve-root /x')).toBe('rm -rf --no-preserve-root /x')
-    expect(redactFragmentForAudit('git push --force-with-lease')).toBe('git push --force-with-lease')
-  })
-  test('real control characters are dropped', () => {
-    // Built from char codes, never typed literally: a raw ESC/NUL in a source
-    // file is invisible in review and turns the file binary to grep.
-    const ESC = String.fromCharCode(0x1b)
-    const NUL = String.fromCharCode(0x00)
-    // An ESC sequence would repaint the terminal of whoever tails the journal.
-    expect(redactFragmentForAudit(`git push${ESC}[31m origin`)).toBe('git push [31m origin')
-    expect(redactFragmentForAudit(`a${NUL}b`)).toBe('a b')
-    expect(redactFragmentForAudit('git\tpush\norigin')).toBe('git push origin')
+  // The mutant this kills: re-adding the field on the verdict. It is a shape
+  // assertion because a value assertion would pass on an empty-string stub.
+  test('no verdict carries command text, whatever the tier', () => {
+    const commands = [
+      'echo ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789 | sudo tee /etc/z',
+      'PGPASSWORD=hunter2 psql -h db.internal -U app',
+      'git push -u origin main',
+      'ls -la',
+    ]
+    for (const command of commands) {
+      const v = classify('Bash', { command }, VARIANT1)
+      expect(Object.keys(v).sort()).toEqual(['matchedRule', 'reason', 'tier'])
+      expect(JSON.stringify(v)).not.toContain('hunter2')
+      expect(JSON.stringify(v)).not.toContain('ghp_')
+    }
+    const read = classify('Read', { file_path: '/tmp/a.ts' }, VARIANT1)
+    expect(Object.keys(read).sort()).toEqual(['matchedRule', 'reason', 'tier'])
   })
 })
 
-// ── PR #6 round 1: the window was cut BEFORE the secret decision ──────────
-//
-// Every case below starts from a COMMAND and goes through the classifier. The
-// previous round's secret tests fed redactFragmentForAudit a hand-written
-// string, so removing redaction from the command path left them all green —
-// the suite agreed with the defect. These are the ones that must go red.
-//
-// The operator's shipped example policy carries six bash_patterns; `psql` is
-// one of them (plugin/docs/permission-policy.example.yaml), which is how a
-// prefixed env assignment ended up quoted into the journal in full.
-const OPERATOR_PATTERNS: PermissionPolicy = {
-  default_tier: 'allow',
-  confirm: { bash_patterns: ['psql', 'deploy.sh', 'curl'] },
-}
-
-function fragmentOf(command: string, policy: PermissionPolicy = OPERATOR_PATTERNS): string {
-  const v = classify('Bash', { command }, policy)
-  expect(v.tier).toBe('confirm')
-  return v.matchedFragment
-}
-
-describe('the secret decision is made on the whole command, not on the window', () => {
-  test('a prefixed env assignment beside the match never reaches the journal', () => {
-    // The reviewer's reproduction, verbatim in shape: PGPASSWORD=<value> psql.
-    // Cutting +-16 chars first split `PGPASSWORD=` off its own name, so the
-    // `name=value` detector no longer matched while the value stayed whole.
-    const f = fragmentOf('PGPASSWORD=hunter2correcthorse psql -h db.internal -U app')
-    expect(f).toBe(FRAGMENT_REDACTED)
-  })
-
-  test('a secret far outside the window still redacts the whole fragment', () => {
-    // 200 chars away from the match: the window would never have seen it, and
-    // that was the bug — the window decided, so distance meant safety.
-    // Quote-free on purpose: since round 3 a quoted command never reaches the
-    // secret detectors at all, so a quoted sample would test the narrowing
-    // instead of the thing this case is about.
-    const far = 'export API_KEY=sk-live_0a1b2c3d4e5f6a7b8c9d ' + ' '.repeat(120) + '&& psql -c select1'
-    expect(fragmentOf(far)).toBe(FRAGMENT_REDACTED)
-  })
-
-  test('flag-form credentials are caught, with and without a separator', () => {
-    expect(fragmentOf('psql --password hunter2correct -h db')).toBe(FRAGMENT_REDACTED)
-    expect(fragmentOf('curl -u admin:s3cr3tvalue https://api.example/x')).toBe(FRAGMENT_REDACTED)
-    expect(fragmentOf('curl https://user:p4ssw0rd@api.example/x')).toBe(FRAGMENT_REDACTED)
-    expect(fragmentOf('psql --api-key 8f3b1c9d2e4a6b8c -h db')).toBe(FRAGMENT_REDACTED)
-  })
-
-  test('base64 survives the character class that broke the plain run rule', () => {
-    // `+`, `/` and `=` split the [A-Za-z0-9_-]{32,} run into short pieces.
-    const blob = 'aGVsbG8gd29ybGQgc2VjcmV0IHZhbHVlIGhlcmU+Pz8/'
-    expect(fragmentOf(`curl -d ${blob} https://x/y`)).toBe(FRAGMENT_REDACTED)
-  })
-
-  test('a heredoc body is scanned too, not just the line of the match', () => {
-    // Unquoted delimiter: a quoted one (`<<'SQL'`) would stop at the narrowing.
-    const cmd = 'psql -f - <<SQL\n-- deploy token: ghp_QqWwEeRrTtYyUuIiOoPp0123456789\nSQL'
-    expect(fragmentOf(cmd)).toBe(FRAGMENT_REDACTED)
-  })
-
-  test('zero-width and fullwidth characters cannot hide the credential name', () => {
-    const ZWSP = String.fromCharCode(0x200b)
-    const FULLWIDTH_COLON = String.fromCharCode(0xff1a)
-    expect(fragmentOf(`psql -h db bearer${ZWSP} tOkEnValue12345678`)).toBe(FRAGMENT_REDACTED)
-    expect(fragmentOf(`psql -h db token${FULLWIDTH_COLON}tOkEnValue12345678`)).toBe(FRAGMENT_REDACTED)
-  })
-
-  // NEGATIVE CONTROL. Redacting everything would pass every test above and be
-  // useless: the point of the field is to quote the command. These must keep
-  // their text — including the operator's own branch name, a 32-char run.
-  test('ordinary commands keep a readable fragment', () => {
-    const f = fragmentOf('cd /srv && psql -h db.internal -f /srv/report.sql -o /tmp/out')
-    expect(f).toContain('psql -h db.internal')
-    expect(f).not.toBe(FRAGMENT_REDACTED)
-
-    const push = classify(
-      'Bash',
-      { command: 'git push -u origin docs/restore-lost-rules-20260801' },
-      VARIANT1,
-    )
-    expect(push.matchedFragment).toContain('git push -u origin')
-    expect(push.matchedFragment).not.toBe(FRAGMENT_REDACTED)
-  })
-
-  test('the window never crosses a newline', () => {
-    const cmd = 'echo first line here\npsql -h db\necho third line here'
-    const f = fragmentOf(cmd)
-    expect(f).toContain('psql -h db')
-    expect(f).not.toContain('first line')
-    expect(f).not.toContain('third line')
-  })
-})
-
-// ── PR #6 round 2 ────────────────────────────────────────────────────────
-//
-// Round 1 matched credential names EXACTLY, so every ordinary spelling of the
-// same thing walked past: `--db-password`, `--pw`, `-P`, `PW=`. Entropy cannot
-// rescue these — a human password is short and low-entropy by nature.
-describe('credential names: suffixes, short spellings, short values', () => {
-  test('a vendor-prefixed name is still a password name', () => {
-    expect(fragmentOf('--db-password hunter2correct psql -h db')).toBe(FRAGMENT_REDACTED)
-    expect(fragmentOf('--proxy-password hunter2correct psql -h db')).toBe(FRAGMENT_REDACTED)
-    expect(fragmentOf('psql --api-token abcdefgh12345678')).toBe(FRAGMENT_REDACTED)
-    expect(fragmentOf('psql --client_secret abcdefgh12345678')).toBe(FRAGMENT_REDACTED)
-  })
-
-  test('the short spellings people actually type', () => {
-    expect(fragmentOf('psql --pw hunter2correct')).toBe(FRAGMENT_REDACTED)
-    expect(fragmentOf('psql --pass hunter2correct')).toBe(FRAGMENT_REDACTED)
-    expect(fragmentOf('psql --auth hunter2correct')).toBe(FRAGMENT_REDACTED)
-    expect(fragmentOf('psql --key hunter2correct')).toBe(FRAGMENT_REDACTED)
-    // Uppercase -P is mysql's password flag. Lowercase -p is NOT included:
-    // `mkdir -p`, `docker run -p 80:80` would drown the journal in [redacted].
-    expect(fragmentOf('psql -P hunter2correct')).toBe(FRAGMENT_REDACTED)
-  })
-
-  test('environment assignments, not only flags', () => {
-    expect(fragmentOf('PW=hunter2correct psql -h db')).toBe(FRAGMENT_REDACTED)
-    expect(fragmentOf('SESSION=abcdef123456 psql -h db')).toBe(FRAGMENT_REDACTED)
-  })
-
-  test('a short value is still a secret — length and entropy are not the test', () => {
-    expect(fragmentOf('psql --otp 837451')).toBe(FRAGMENT_REDACTED)
-    expect(fragmentOf('psql --pin 8471')).toBe(FRAGMENT_REDACTED)
-  })
-
-  test('a login verb carrying a user and a secret', () => {
-    expect(fragmentOf('psql -h db; login andrei hunter2correct')).toBe(FRAGMENT_REDACTED)
-  })
-
-  // NEGATIVE CONTROLS for the suffix rule. `--monkey` ends in "key" and must
-  // not be treated as one, or the field dies of false positives.
-  test('names that merely end in a credential word are left alone', () => {
-    const f = fragmentOf('psql --monkey business -h db')
-    expect(f).not.toBe(FRAGMENT_REDACTED)
-    expect(fragmentOf('mkdir -p /tmp/x && psql -h db')).not.toBe(FRAGMENT_REDACTED)
-    // docker's uid:gid pair is not basic auth (reviewer NOTE, round 2).
-    expect(fragmentOf('docker run -u 1000:1000 img psql')).not.toBe(FRAGMENT_REDACTED)
-  })
-})
-
-// ── PR #6 round 3: the tool is narrowed, not extended again ──────────────
-//
-// Three rounds, and each one the same half produced a new bypass: exact names,
-// then prefixed names, then names broken by quotes. That is an open list, not
-// a set of cases — the next entries are `$'PASS'`, backslash joining, variable
-// substitution. So the default is inverted: a fragment is written only when
-// the whole command is provably plain. Quote parsing is precisely where we
-// have been wrong three times, so we do not parse quotes at all.
-describe('a command carrying shell quoting is not quoted in the journal', () => {
-  test("codex probe 1: a name broken by quotes inside an env assignment", () => {
-    const f = fragmentOf("env PG'PASSWORD'=hunter2 psql -h db")
-    expect(f).not.toContain('hunter2')
-    expect(f).toBe(FRAGMENT_NOT_QUOTED)
-  })
-
-  test('codex probe 2: a name broken by quotes inside a flag', () => {
-    const f = fragmentOf("--db-'password' hunter2 psql")
-    expect(f).not.toContain('hunter2')
-    expect(f).toBe(FRAGMENT_NOT_QUOTED)
-  })
-
-  test('every escaping character counts, not only the quote', () => {
-    expect(fragmentOf('psql -h db -c select\\ 1')).toBe(FRAGMENT_NOT_QUOTED)
-    expect(fragmentOf('psql -h $DB_HOST')).toBe(FRAGMENT_NOT_QUOTED)
-    expect(fragmentOf('psql -h `hostname`')).toBe(FRAGMENT_NOT_QUOTED)
-    expect(fragmentOf('psql -h "db"')).toBe(FRAGMENT_NOT_QUOTED)
-  })
-
-  // THE PRICE, recorded as expected behaviour rather than discovered later in
-  // the journal: an ordinary quoted command with no secret in it loses its
-  // fragment too. matched_rule and cwd still answer "why was I asked".
-  test('price: a harmless quoted command also loses its fragment', () => {
-    const f = fragmentOf('psql -h db.internal -c "select count(*) from users"')
-    expect(f).toBe(FRAGMENT_NOT_QUOTED)
-    expect(f).not.toContain('select count')
-  })
-
-  // NEGATIVE CONTROL: without quoting, nothing changes.
-  test('a plain command still gets its quote', () => {
-    const f = fragmentOf('cd /srv && psql -h db.internal -U app_service')
-    expect(f).toContain('psql -h db.internal')
-    expect(f).not.toBe(FRAGMENT_NOT_QUOTED)
-  })
-})
-
-// MUST-2 round 2: `bash_patterns` accept globs, and `*` becomes `.*`, so the
-// match ran to the end of the line and the "16 chars of context" window became
-// the whole command. The window must be bounded by its OWN length, whatever
-// the match swallowed — that way a glob in the policy decides nothing.
-describe('a greedy glob cannot widen the window', () => {
-  const GLOB_POLICY: PermissionPolicy = {
-    default_tier: 'allow',
-    confirm: { bash_patterns: ['runjob*'] },
-  }
-  test('the fragment stays a window, not the line', () => {
-    const tail = '--step one --step two --step three --step four --step five --final marker'
-    const f = fragmentOf(`runjob ${tail}`, GLOB_POLICY)
-    // 16 chars of context on each side plus a bounded slice of the match.
-    expect(f.length).toBeLessThanOrEqual(64)
-    expect(f).toContain('runjob')
-    expect(f).not.toContain('marker')
-  })
-})
-
-// MUST-3 round 2: the decision was taken on the LOWERCASED command whenever a
-// character changed length under toLowerCase. One U+0130 disabled every
-// case-sensitive detector — and the journal then received a lowercased command
-// presented as a verbatim quote.
-describe('a length-changing character cannot disable the case-sensitive rules', () => {
-  const GLOB_POLICY: PermissionPolicy = {
-    default_tier: 'allow',
-    confirm: { bash_patterns: ['runjob*'] },
-  }
-  const DOTTED_I = String.fromCharCode(0x0130) // 'İ' lowercases to two chars
-
-  test('the AWS key shape is caught with and without the dotted I', () => {
-    expect(fragmentOf('runjob AKIAJ7EXAMPLE0KEY', GLOB_POLICY)).toBe(FRAGMENT_REDACTED)
-    expect(fragmentOf(`runjob --note ${DOTTED_I}stanbul AKIAJ7EXAMPLE0KEY`, GLOB_POLICY)).toBe(
-      FRAGMENT_REDACTED,
-    )
-  })
-
-  test('no lowercased copy is ever passed off as a quote', () => {
-    // We cannot locate the match in the raw text once the indices no longer
-    // line up, so there is no fragment to quote. Empty beats a quote that is
-    // quietly not what was typed (`-F` arriving as `-f`).
-    const v = classify('Bash', { command: `psql -F x --note ${DOTTED_I}stanbul` }, OPERATOR_PATTERNS)
-    expect(v.tier).toBe('confirm')
-    expect(v.matchedFragment).toBe('')
-  })
-})
-
-// SHOULD-2 round 2: the cost of scanning the whole command, made visible.
-// These are NOT approvals — they are the price of the trade, named so a
-// regression in usefulness shows up here instead of in the journal.
-describe('cost of the whole-command scan (documented, not endorsed)', () => {
-  test('opaque but harmless identifiers lose their fragment today', () => {
-    const sha40 = 'da39a3ee5e6b4b0d3255bfef95601890afd80709'
-    const uuid = '3f2504e0-4f89-11d3-9a0c-0305e82c3301'
-    const container = '9f2b7c1d4e6a8b0c2d4e6f8a0b2c4d6e'
-    expect(fragmentOf(`psql -f q.sql -- ${sha40}`)).toBe(FRAGMENT_REDACTED)
-    expect(fragmentOf(`psql --session-note ${uuid}`)).toBe(FRAGMENT_REDACTED)
-    expect(fragmentOf(`docker exec ${container} psql`)).toBe(FRAGMENT_REDACTED)
-  })
-  test('but ordinary work keeps its quote', () => {
-    expect(fragmentOf('cd /srv && psql -h db.internal -f q.sql')).toContain('psql -h db.internal')
-    const branch = classify(
-      'Bash',
-      { command: 'git push -u origin feature/permission-gate-fragment' },
-      VARIANT1,
-    )
-    expect(branch.matchedFragment).toContain('git push -u origin')
-  })
-})
 
 // MUST-2 (codex): an operator rule label carries the raw pattern from the
 // policy file. A pattern naming a key path is written into an append-only log
@@ -1818,37 +1522,23 @@ describe('redactRuleForAudit', () => {
   })
 })
 
-// MUST-1, last clause: the route's guard must be an INDEPENDENT check. It is
-// entropy/character-class based, so it catches opaque values the name-pattern
-// list has no name for — including ones too short for the 32-char run rule.
-describe('guardFragmentForJournal — the second fence uses a different mechanism', () => {
-  // Round 2 found both "entropy" cases were decided by the FIRST fence, so
-  // deleting entropy altogether left the suite green. Each value below is
-  // asserted to pass fence one FIRST — that assertion is what makes the second
-  // assertion about entropy mean anything.
-  test('an opaque token that fence one lets through is refused by entropy', () => {
-    // 24 chars, lower+digit only: too short for the 32-char run rule and only
-    // two alphanumeric classes, so the name/shape fence has nothing to say.
-    const value = 'deploy q7x2m9k4z8v3n6b1w5j0t7r2 now'
-    expect(redactFragmentForAudit(value)).not.toBe(FRAGMENT_REDACTED)
-    expect(guardFragmentForJournal(value)).toBe(FRAGMENT_REDACTED)
+
+// The secret-shape scan survives the fragment's removal because
+// redactRuleForAudit still needs it: a rule label ends in the operator's own
+// pattern, which is untrusted text. Nothing else calls it.
+describe('fragmentIsSecretShaped — the one surviving consumer is redactRuleForAudit', () => {
+  test('basic auth is secret-shaped whatever the value looks like', () => {
+    // Round 2 added a lookahead exempting a numeric pair, to stop
+    // `docker run -u 1000:1000` reading as basic auth. It exempted real
+    // credentials too: `curl -u 4815162:3423337` went to the journal in full
+    // (reviewer, round 4). A cosmetic false positive is not worth a hole.
+    expect(fragmentIsSecretShaped('curl -u 4815162:3423337 https://api.example/x')).toBe(true)
+    expect(fragmentIsSecretShaped('curl -u admin:s3cr3tvalue https://api.example/x')).toBe(true)
+    expect(fragmentIsSecretShaped('curl https://user:p4ssw0rd@api.example/x')).toBe(true)
   })
-  test('base64 containing slashes is refused by entropy', () => {
-    // The opaque-run scan splits on `/`, which chops this into short pieces;
-    // the entropy scan keeps `/` inside the token and sees it whole.
-    const value = 'deploy aGVsbG8/d29ybGQ/c2VjcmV0/dmFsdWU now'
-    expect(redactFragmentForAudit(value)).not.toBe(FRAGMENT_REDACTED)
-    expect(guardFragmentForJournal(value)).toBe(FRAGMENT_REDACTED)
-  })
-  test('ordinary command text passes both fences', () => {
-    expect(guardFragmentForJournal('git push -u origin docs/restore-lost-rules-20260801')).toBe(
-      'git push -u origin docs/restore-lost-rules-20260801',
-    )
-    expect(guardFragmentForJournal('psql -h db.internal -U app_service_account')).toBe(
-      'psql -h db.internal -U app_service_account',
-    )
-  })
-  test('it still catches what the pattern fence catches', () => {
-    expect(guardFragmentForJournal('export TOKEN=sk-live_9f2b7c1d4e6a8b0c2d4e')).toBe(FRAGMENT_REDACTED)
+  test('ordinary rule text is not secret-shaped', () => {
+    expect(fragmentIsSecretShaped('deploy.sh')).toBe(false)
+    expect(fragmentIsSecretShaped('git push')).toBe(false)
+    expect(fragmentIsSecretShaped('supabase db')).toBe(false)
   })
 })

@@ -10,7 +10,7 @@ import type { StatePaths } from '../../config.js'
 import { resolvePermissionGateAllowedUserIds } from '../../config.js'
 import type { Logger } from '../../log.js'
 import { PermissionRequestRouteSchema, type PermissionRequestRoute } from '../../schemas.js'
-import { guardFragmentForJournal, redactRuleForAudit } from '../../security/permission-policy.js'
+import { redactRuleForAudit } from '../../security/permission-policy.js'
 import type { WebhookDeps } from '../server.js'
 import { authGate, readJsonBody, reply } from './shared.js'
 
@@ -142,15 +142,16 @@ export async function handlePermissionRequest(
       // (`confirm:bash_patterns:<pattern>`), so it is untrusted text too — a
       // pattern naming a key would otherwise be copied here verbatim (codex).
       matched_rule: redactRuleForAudit(payload.matched_rule),
-      // The guard here is a DIFFERENT mechanism from the classifier's (entropy
-      // over long tokens, not a list of credential names). Re-running the same
-      // check on the same bytes would be one fence spelled twice; this one can
-      // refuse what the first had no name for, and this function is the one
-      // that writes the file.
-      matched_fragment: guardFragmentForJournal(payload.matched_fragment),
+      // NO command text is recorded. A quoted fragment of the command lived
+      // here until 2026-08-01; four review rounds found five ways to walk a
+      // credential past its redaction, so the field is gone rather than
+      // guarded again. What "why was I asked" needs is the rule name, and that
+      // is above.
+      //
       // The working directory of the call: two worktrees of one repository
       // produce byte-identical git author/committer, so the object alone cannot
-      // say which tree acted.
+      // say which tree acted. Written as received and NOT redacted — a path is
+      // not a command, and no argument values reach this field.
       cwd: payload.cwd,
       timeout_ms: effectiveTimeoutMs,
     })

@@ -43,14 +43,24 @@ export interface PermissionVerdict {
   readonly reason: string
   /** The rule that matched, for audit. `builtin:*` for baked-in rules. */
   readonly matchedRule: string
-  /**
-   * The command text the rule matched, redacted for the audit log. Empty when
-   * the rule matched no literal text (structural detectors, path/tool rules) —
-   * `FRAGMENT_REDACTED` when text matched but could not be shown safely.
-   * Never a guess: an invented fragment reads as evidence in the journal.
-   */
-  readonly matchedFragment: string
 }
+
+// NO `matchedFragment` HERE, AND THAT IS THE DESIGN (PR #6, four review rounds).
+//
+// The verdict used to carry a quote of the command text that matched, so the
+// journal could show it. Four rounds produced five bypasses of the redaction
+// guarding it: exact names, prefixed names (`--db-password`), names split by
+// quotes (`PG'PASSWORD'=`), a name written as one word (`PGPASSWORD=`), an
+// assignment glued to a shell operator (`stage;PW=`), plus `redis-cli -a`.
+// What they share is not spelling, it is the PREMISE — that you can look at
+// command text and decide whether it is safe to write down. Every round
+// refuted that premise again, and one round's cosmetic fix (exempting
+// `docker run -u 1000:1000`) re-opened `curl -u 4815162:3423337`.
+//
+// So the field is gone rather than guarded better. "It is not written" is
+// proved by absence: nothing to go stale, nothing to bypass, nothing to watch.
+// `matchedRule` and `cwd` remain, and they are what was actually asked for —
+// a card that names its rule. The quote of the command was an addition.
 
 /** One tier's matchers. All fields optional; absent = matches nothing. */
 export interface PolicyRules {
@@ -1876,21 +1886,11 @@ export function globMatch(pattern: string, value: string): boolean {
   }
 }
 
-/** Where a bash pattern hit, for the audit fragment. */
-interface BashHit {
-  readonly index: number
-  readonly length: number
-}
-
+// Reports only WHETHER the pattern hit. A locating variant returning the hit's
+// offset lived here while the journal quoted the command; the quote is gone
+// (see PermissionVerdict), and an offset nobody reads is a mechanism that
+// reads as a live one in review.
 function bashMatch(pattern: string, commandLower: string): boolean {
-  return bashMatchLocate(pattern, commandLower) !== null
-}
-
-// Same matching rules as before, but reporting WHERE the hit landed. The
-// boolean form used to be the only one, which is why no caller could say what
-// text had matched — the journal recorded a card with a rule name it did not
-// have and a fragment nobody could reconstruct.
-function bashMatchLocate(pattern: string, commandLower: string): BashHit | null {
   const pat = pattern.toLowerCase()
   const hasMeta = pat.includes('*') || pat.includes('?')
   if (!hasMeta) {
@@ -1902,11 +1902,9 @@ function bashMatchLocate(pattern: string, commandLower: string): BashHit | null 
     // operator patterns like `.env` or `-rf ` keep substring semantics.
     if (/^[a-z0-9]/.test(pat)) {
       const escaped = pat.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-      const m = new RegExp(`(?<![a-z0-9_-])${escaped}`).exec(commandLower)
-      return m === null ? null : { index: m.index, length: m[0].length }
+      return new RegExp(`(?<![a-z0-9_-])${escaped}`).test(commandLower)
     }
-    const at = commandLower.indexOf(pat)
-    return at < 0 ? null : { index: at, length: pat.length }
+    return commandLower.includes(pat)
   }
   // Bash commands routinely contain slashes (paths, URLs), so `*` must cross
   // `/` here — unlike path globs. Build an unanchored regex: `*`→`.*`,
@@ -1918,10 +1916,9 @@ function bashMatchLocate(pattern: string, commandLower: string): BashHit | null 
     else re += ch.replace(/[.+^${}()|[\]\\]/g, '\\$&')
   }
   try {
-    const m = new RegExp(re).exec(commandLower)
-    return m === null ? null : { index: m.index, length: m[0].length }
+    return new RegExp(re).test(commandLower)
   } catch {
-    return null
+    return false
   }
 }
 
@@ -1991,51 +1988,13 @@ function matchAllBashRules(rules: readonly string[], commandLower: string): stri
 // moment it looks like a secret. An empty field costs a reader one guess; a
 // token in an append-only log cannot be taken back.
 
-/** Chars of command kept on each side of the match — enough to see WHERE in a
- *  compound command the rule fired, small enough not to scoop a whole argv. */
-const FRAGMENT_CONTEXT_CHARS = 16
-/** Most of the MATCH itself that is ever shown. A glob pattern can match to the
- *  end of the line; without this the window is only as small as the operator's
- *  patterns happen to be. */
-const FRAGMENT_MATCH_MAX_CHARS = 32
 /** Rule labels get their own, larger cap: a label truncated below the length
  *  the schema accepts (256) stops matching any line in the policy file, and
  *  naming the rule is the entire point of the field. */
 const RULE_MAX_CHARS = 256
-/** Hard cap on the stored fragment (glob rules can match a very long span). */
-export const FRAGMENT_MAX_CHARS = 120
 /** Stored instead of the text when the text cannot be shown safely. */
 export const FRAGMENT_REDACTED = '[redacted]'
 
-/**
- * Stored instead of the text when the command carries shell quoting or
- * substitution. Read by the operator, hence Russian, and deliberately not the
- * same marker as FRAGMENT_REDACTED: "we refused to quote this" and "we found
- * something secret in it" are different facts about the command.
- */
-export const FRAGMENT_NOT_QUOTED = '[фрагмент не записан: команда содержит экранирование]'
-
-/**
- * Quoting / substitution characters. Their presence means we do not write a
- * fragment at all.
- *
- * WHY SO BLUNT (reviewers, PR #6, third bypass in the same half): the name
- * detectors work on whitespace-separated raw tokens, so a quote placed inside
- * a name defeats them — `env PG'PASSWORD'=hunter2 psql` scanned clean and the
- * journal received `SSWORD'=hunter2 psql -h db`, value included. Removing the
- * quotes ourselves is not the fix: quote parsing is the exact thing we have
- * now got wrong three times (exact names, prefixed names, quoted names), and
- * the remaining bypasses -- `$'PASS'`, backslash joining, variable
- * substitution -- are an open list. So the DEFAULT is inverted: a fragment is
- * written only when the whole command is provably plain.
- */
-const SHELL_QUOTING_RE = /['"\\$`]/
-
-// Shapes that mean "this text is a credential, not a command". Deliberately
-// about VALUES, not paths: a secret PATH (.env, id_rsa, ~/.aws) is already a
-// hard-deny above and never reaches a confirm card, but an inline token in an
-// otherwise legitimate command does. Matching is shape-based on purpose — the
-// audit writer must not need to know which vendor issued the token.
 // Credential NAMES, in one string so the `name=value` form and the flag form
 // (`--password secret`) cannot drift apart.
 const CREDENTIAL_NAME =
@@ -2058,10 +2017,13 @@ const SECRET_SHAPED_RES: readonly RegExp[] = [
   // `--password hunter2` (value in the NEXT argv word) walked straight past it
   // (reviewer, PR #6). Full names only: a bare `-p` would fire on `mkdir -p`.
   new RegExp(`(?:^|\\s)--?(?:${CREDENTIAL_NAME})\\b(?:[=:]|\\s+)\\S`, 'i'),
-  // Basic auth as a `user:password` pair — in a `-u` flag or inside a URL. The
-  // lookahead exempts a numeric pair: `docker run -u 1000:1000` is a uid:gid,
-  // not a credential (reviewer NOTE, round 2).
-  /(?:^|\s)--?u(?:ser(?:name)?)?(?:[=:]|\s+)(?![0-9]+:[0-9]+(?:\s|$))[^\s:/]+:[^\s]/i,
+  // Basic auth as a `user:password` pair — in a `-u` flag or inside a URL.
+  // Round 2 carried a lookahead exempting an all-numeric pair, so that
+  // `docker run -u 1000:1000` would not read as a credential. It exempted
+  // `curl -u 4815162:3423337` just as well, and that one went to the journal
+  // whole (reviewer, round 4). Removed: a cosmetic false positive costs a
+  // needlessly redacted rule label, the exemption cost a credential.
+  /(?:^|\s)--?u(?:ser(?:name)?)?(?:[=:]|\s+)[^\s:/]+:[^\s]/i,
   /\/\/[^\s/@:]+:[^\s/@]+@/,
 ]
 
@@ -2184,32 +2146,6 @@ export function fragmentIsSecretShaped(text: string): boolean {
   )
 }
 
-/** Bits per character of a token, for the journal-writer's second fence. */
-const ENTROPY_MIN_TOKEN_CHARS = 24
-const ENTROPY_BITS_THRESHOLD = 4.0
-
-function shannonBits(token: string): number {
-  const counts = new Map<string, number>()
-  for (const ch of token) counts.set(ch, (counts.get(ch) ?? 0) + 1)
-  let bits = 0
-  for (const n of counts.values()) {
-    const p = n / token.length
-    bits -= p * Math.log2(p)
-  }
-  return bits
-}
-
-function highEntropyToken(text: string): boolean {
-  for (const token of text.split(/[^A-Za-z0-9+/=_-]+/)) {
-    if (token.length < ENTROPY_MIN_TOKEN_CHARS) continue
-    // A single alphanumeric class (a long number, a repeated letter) is
-    // repetition, not a secret; two keeps prose and paths out.
-    if (alnumClassCount(token) < 2) continue
-    if (shannonBits(token) >= ENTROPY_BITS_THRESHOLD) return true
-  }
-  return false
-}
-
 /**
  * Zero-width characters out, control characters and whitespace runs collapsed
  * to one space. The class is control-characters-plus-space and DEL; it must
@@ -2222,43 +2158,6 @@ function redactableFlatten(text: string): string {
     .replace(ZERO_WIDTH_RE, '')
     .replace(/[\u0000-\u0020\u007f]+/g, ' ')
     .trim()
-}
-
-/**
- * FIRST fence (classifier side): name-and-shape based. Refuses the whole text
- * when any known credential shape appears anywhere in it. Whitespace and
- * control characters are collapsed first: a raw newline would split one JSONL
- * record into two and corrupt every reader.
- */
-export function redactFragmentForAudit(fragment: string): string {
-  // Collapse first so the stored text is one JSONL-safe line.
-  const flat = redactableFlatten(fragment)
-  const capped = flat.length > FRAGMENT_MAX_CHARS ? flat.slice(0, FRAGMENT_MAX_CHARS) : flat
-  if (capped.length === 0) return ''
-  // Decide on the ORIGINAL text, never on the collapsed-and-capped copy: the
-  // cut is what broke the `name=value` word boundary in round 1.
-  return fragmentIsSecretShaped(fragment) ? FRAGMENT_REDACTED : capped
-}
-
-/** Zero-width characters and control characters out, whitespace runs collapsed,
- *  length capped. Must NOT touch the hyphen: `git reset --hard` logged as
- *  `git reset hard` reads as a quote while being a different command. */
-function sanitizeFragmentText(text: string): string {
-  const flat = redactableFlatten(text)
-  return flat.length > FRAGMENT_MAX_CHARS ? flat.slice(0, FRAGMENT_MAX_CHARS) : flat
-}
-
-/**
- * SECOND fence (journal-writer side), deliberately a DIFFERENT mechanism:
- * Shannon entropy over long tokens instead of a list of known names. Two copies
- * of one denylist are one fence, not two — this one catches opaque values that
- * no name introduces and that are too short for the 32-char run rule. It
- * over-refuses, which is the right side to fail on.
- */
-export function guardFragmentForJournal(fragment: string): string {
-  const first = redactFragmentForAudit(fragment)
-  if (first === FRAGMENT_REDACTED || first.length === 0) return first
-  return highEntropyToken(normalizeForSecretScan(fragment)) ? FRAGMENT_REDACTED : first
 }
 
 /**
@@ -2276,84 +2175,6 @@ export function redactRuleForAudit(rule: string): string {
   if (parts.length < 3) return fragmentIsSecretShaped(flat) ? FRAGMENT_REDACTED : flat
   const pattern = parts.slice(2).join(':')
   return fragmentIsSecretShaped(pattern) ? `${parts[0]}:${parts[1]}:${FRAGMENT_REDACTED}` : flat
-}
-
-/** The command window around a bash-pattern match, redacted. '' when the
- *  pattern does not actually locate (defensive: caller already matched). */
-function bashFragment(rawCommand: string, commandLower: string, pattern: string): string {
-  const hit = bashMatchLocate(pattern, commandLower)
-  if (hit === null) return ''
-  // The index comes from the LOWERCASED command. Unicode toLowerCase can change
-  // a string's LENGTH (İ → i̇), which shifts every later index — slicing the raw
-  // command by those indices would then cut a window we never inspected, and a
-  // window nobody inspected is exactly how a token reaches a log. Only trust
-  // the raw text when the lengths prove the two strings are still aligned.
-  // NARROWING (round 3) — this stands BEFORE every detector below because it
-  // is cruder and therefore more reliable than all of them. If the command
-  // carries any quoting or substitution we do not attempt to quote it at all.
-  // The cost is real and accepted: an ordinary `psql -c "select 1"` loses its
-  // fragment. matched_rule and cwd stay, and they are the answer to "why was I
-  // asked" — the fragment was only ever convenience, and convenience loses to
-  // a password sitting in an append-only file.
-  if (SHELL_QUOTING_RE.test(rawCommand)) return FRAGMENT_NOT_QUOTED
-
-  // The DECISION is always taken on the raw command. Round 2 judged the
-  // lowercased copy whenever some character changed length under toLowerCase,
-  // and a single U+0130 therefore switched off every case-sensitive detector
-  // (`AKIA`, `AIza`) plus the mixed-class rule — one character, chosen by
-  // whoever wrote the command, disabling half the guard (reviewer MUST-3).
-  if (fragmentIsSecretShaped(rawCommand)) return FRAGMENT_REDACTED
-  // Past this point we need to CUT the raw text at indices found in the
-  // lowercased one. When toLowerCase changed the length those indices no
-  // longer line up, so there is nothing we can honestly quote: emitting the
-  // lowercased copy would put `-f` in the journal as a verbatim quote of `-F`.
-  // A quote that is quietly not what was typed is worse than no quote.
-  if (rawCommand.length !== commandLower.length) return ''
-  const source = rawCommand
-
-  // ORDER IS THE WHOLE POINT (reviewer MUST-1, PR #6). Round 1 cut the window
-  // FIRST and judged the cut. The cut broke the word boundary that the
-  // `name=value` detector needs -- `PGPASSWORD=` lost its own name to the left
-  // edge while the value stayed whole inside the window -- and the value was
-  // written to the journal in full. So the decision is made on the ENTIRE
-  // command, and the window is cut only once that command is known to carry
-  // nothing secret. A secret far outside the window now costs the fragment;
-  // that is the cheap side of the trade.
-
-  // The window is bounded by its OWN length, not by how much the match
-  // swallowed. `bash_patterns` accept globs and `*` compiles to `.*`, so a
-  // pattern like `runjob*` matches to the end of the line and the "16 chars of
-  // context" window silently became the whole command (reviewer MUST-2). With
-  // this clamp a glob in the operator's policy decides nothing about size, and
-  // we do not need to read that policy to know it.
-  const shown = Math.min(hit.length, FRAGMENT_MATCH_MAX_CHARS)
-  let from = Math.max(0, hit.index - FRAGMENT_CONTEXT_CHARS)
-  let to = Math.min(source.length, hit.index + shown + FRAGMENT_CONTEXT_CHARS)
-  // Keep the window on the line the match is on: a heredoc body otherwise gets
-  // dragged in and the fragment stops being a quote of the command.
-  const lineStart = source.lastIndexOf('\n', Math.max(0, hit.index - 1))
-  if (lineStart >= from) from = lineStart + 1
-  const lineEnd = source.indexOf('\n', hit.index + hit.length)
-  if (lineEnd !== -1 && lineEnd < to) to = lineEnd
-  return sanitizeFragmentText(source.slice(from, to))
-}
-
-// rulesMatch reports a LABELLED hit (`bash_patterns:<pat>`, `tools:<glob>`,
-// `read_paths:<glob>`, …). Only the bash_patterns family matched command TEXT;
-// a tool or path rule matched the tool name / file path, both of which the
-// journal already carries in `tool_name` and the prompt preview. Re-deriving
-// the pattern from the label keeps rulesMatch's single-string contract, which
-// a dozen call sites and tests depend on.
-const BASH_PATTERN_LABEL = 'bash_patterns:'
-
-function bashPatternFragment(
-  rawCommand: string | undefined,
-  commandLower: string | undefined,
-  hitLabel: string,
-): string {
-  if (rawCommand === undefined || commandLower === undefined) return ''
-  if (!hitLabel.startsWith(BASH_PATTERN_LABEL)) return ''
-  return bashFragment(rawCommand, commandLower, hitLabel.slice(BASH_PATTERN_LABEL.length))
 }
 
 /** Merge global + scope rules for one tier (scope rules are additive). */
@@ -2450,7 +2271,7 @@ export function classifyToolCall(input: ClassifyInput): PermissionVerdict {
   const { toolName, toolInput, policy, scope } = input
 
   if (typeof toolName !== 'string' || toolName.length === 0) {
-    return { tier: 'deny', reason: 'malformed tool call: missing tool_name', matchedRule: 'builtin:malformed', matchedFragment: '' }
+    return { tier: 'deny', reason: 'malformed tool call: missing tool_name', matchedRule: 'builtin:malformed' }
   }
   const ti: Record<string, unknown> =
     toolInput !== null && typeof toolInput === 'object' && !Array.isArray(toolInput)
@@ -2464,18 +2285,18 @@ export function classifyToolCall(input: ClassifyInput): PermissionVerdict {
   // the target, so under bypassPermissions it must fail closed to deny rather
   // than fall through to default_tier allow (Codex high, mirrors malformed Bash).
   if (WRITE_PATH_TOOLS.has(toolName) && rawPath === undefined) {
-    return { tier: 'deny', reason: `malformed ${toolName} call: missing file_path`, matchedRule: 'builtin:malformed_path', matchedFragment: '' }
+    return { tier: 'deny', reason: `malformed ${toolName} call: missing file_path`, matchedRule: 'builtin:malformed_path' }
   }
 
   // Bash command extraction is fail-closed: a Bash call with a missing/empty
   // command is malformed and denies (never falls through to default allow).
   const cmdEx = extractCommand(toolName, ti)
   if (cmdEx.kind === 'malformed') {
-    return { tier: 'deny', reason: 'malformed Bash call: missing or empty command', matchedRule: 'builtin:malformed_bash', matchedFragment: '' }
+    return { tier: 'deny', reason: 'malformed Bash call: missing or empty command', matchedRule: 'builtin:malformed_bash' }
   }
   const rawCommand = cmdEx.kind === 'ok' ? cmdEx.command : undefined
   if (rawCommand !== undefined && rawCommand.length > MAX_COMMAND_LEN) {
-    return { tier: 'deny', reason: 'bash command exceeds size cap', matchedRule: 'builtin:command-too-long', matchedFragment: '' }
+    return { tier: 'deny', reason: 'bash command exceeds size cap', matchedRule: 'builtin:command-too-long' }
   }
   const commandLower = rawCommand !== undefined ? rawCommand.toLowerCase() : undefined
 
@@ -2483,7 +2304,7 @@ export function classifyToolCall(input: ClassifyInput): PermissionVerdict {
   if (pathCands && (READ_PATH_TOOLS.has(toolName) || WRITE_PATH_TOOLS.has(toolName))) {
     const hit = matchPathRules(BUILTIN_DENY_PATHS, pathCands)
     if (hit) {
-      return { tier: 'deny', reason: `secret/credential path blocked: ${hit}`, matchedRule: `builtin:deny_path:${hit}`, matchedFragment: '' }
+      return { tier: 'deny', reason: `secret/credential path blocked: ${hit}`, matchedRule: `builtin:deny_path:${hit}` }
     }
   }
   // 2b. Built-in hard-deny — Bash. Catastrophic commands AND secret-path
@@ -2491,11 +2312,11 @@ export function classifyToolCall(input: ClassifyInput): PermissionVerdict {
   if (rawCommand !== undefined) {
     const catastrophic = builtinBashHardDeny(rawCommand)
     if (catastrophic) {
-      return { tier: 'deny', reason: `catastrophic command blocked: ${catastrophic}`, matchedRule: `builtin:deny_bash:${catastrophic}`, matchedFragment: '' }
+      return { tier: 'deny', reason: `catastrophic command blocked: ${catastrophic}`, matchedRule: `builtin:deny_bash:${catastrophic}` }
     }
     if (bashReferencesSecret(rawCommand)) {
       // NO fragment here on purpose: the matching text IS the secret reference.
-      return { tier: 'deny', reason: 'secret/credential reference in Bash command blocked', matchedRule: 'builtin:deny_bash_secret', matchedFragment: '' }
+      return { tier: 'deny', reason: 'secret/credential reference in Bash command blocked', matchedRule: 'builtin:deny_bash_secret' }
     }
     // Non-overridable HARD-DENY: a mutating systemctl on the agent's OWN comms
     // channel (channel-*/gateway) would sever the warchief's Telegram link to
@@ -2504,7 +2325,7 @@ export function classifyToolCall(input: ClassifyInput): PermissionVerdict {
     // a mixed command that also trips a confirm builtin (git-exec-surface, sudo,
     // pipe-interpreter) cannot downgrade this deny to confirm — Codex review HIGH.
     if (commandLower !== undefined && mutatesOwnChannel(commandLower)) {
-      return { tier: 'deny', reason: 'mutating the agent own comms channel (systemctl) would sever the warchief link', matchedRule: 'builtin:deny:own-channel', matchedFragment: '' }
+      return { tier: 'deny', reason: 'mutating the agent own comms channel (systemctl) would sever the warchief link', matchedRule: 'builtin:deny:own-channel' }
     }
   }
 
@@ -2516,7 +2337,7 @@ export function classifyToolCall(input: ClassifyInput): PermissionVerdict {
   // 3. Operator deny.
   const denyHit = rulesMatch(denyRules, toolName, pathCands, commandLower)
   if (denyHit) {
-    return { tier: 'deny', reason: `policy deny (${denyHit})`, matchedRule: `deny:${denyHit}`, matchedFragment: '' }
+    return { tier: 'deny', reason: `policy deny (${denyHit})`, matchedRule: `deny:${denyHit}` }
   }
 
   // 4. Built-in confirm bash — no operator-ALLOW short-circuit (Codex
@@ -2532,7 +2353,6 @@ export function classifyToolCall(input: ClassifyInput): PermissionVerdict {
         tier: 'confirm',
         reason: `risky command needs confirmation: ${standing[0]}`,
         matchedRule: `builtin:confirm_bash:${standing[0]}`,
-        matchedFragment: bashFragment(rawCommand!, commandLower, standing[0]!),
       }
     }
     // Pass the RAW command (commandLower !== undefined ⇒ rawCommand defined):
@@ -2540,9 +2360,7 @@ export function classifyToolCall(input: ClassifyInput): PermissionVerdict {
     // insensitively itself, so lowercasing here would only re-introduce the
     // flag-case collapse (`-C`/`-c`) that bit gitExecSurface.
     if (bashConfirmEvasion(rawCommand!)) {
-      // Structural detector — it matches a pipeline SHAPE, not a literal, so
-      // there is no substring to quote (see matchedFragment on the interface).
-      return { tier: 'confirm', reason: 'pipe-to-interpreter download needs confirmation', matchedRule: 'builtin:confirm_bash:pipe-interpreter', matchedFragment: '' }
+      return { tier: 'confirm', reason: 'pipe-to-interpreter download needs confirmation', matchedRule: 'builtin:confirm_bash:pipe-interpreter' }
     }
     // Non-overridable: git config/hook execution surfaces (a downgraded
     // `git push` must never become arbitrary local code execution). Pass the
@@ -2551,7 +2369,7 @@ export function classifyToolCall(input: ClassifyInput): PermissionVerdict {
     if (gitExecSurface(rawCommand!)) {
       // Structural detector, and on the fail-closed branch (unparseable quoting)
       // nothing "matched" at all — the command simply could not be proven safe.
-      return { tier: 'confirm', reason: 'git config/hook execution surface needs confirmation', matchedRule: 'builtin:confirm_bash:git-exec-surface', matchedFragment: '' }
+      return { tier: 'confirm', reason: 'git config/hook execution surface needs confirmation', matchedRule: 'builtin:confirm_bash:git-exec-surface' }
     }
     // (own-channel systemctl hard-deny was hoisted into the step-2b hard-deny
     // pass above so a co-located confirm builtin can't downgrade it — Codex HIGH.)
@@ -2564,25 +2382,23 @@ export function classifyToolCall(input: ClassifyInput): PermissionVerdict {
       tier: 'confirm',
       reason: `policy confirm (${confirmHit})`,
       matchedRule: `confirm:${confirmHit}`,
-      matchedFragment: bashPatternFragment(rawCommand, commandLower, confirmHit),
     }
   }
 
   // 6. Operator allow.
   const allowHit = rulesMatch(allowRules, toolName, pathCands, commandLower)
   if (allowHit) {
-    return { tier: 'allow', reason: `policy allow (${allowHit})`, matchedRule: `allow:${allowHit}`, matchedFragment: '' }
+    return { tier: 'allow', reason: `policy allow (${allowHit})`, matchedRule: `allow:${allowHit}` }
   }
 
   // 7. Default. Read-only tools always auto-allow.
   if (READ_ONLY_TOOLS.has(toolName)) {
-    return { tier: 'allow', reason: 'read-only tool', matchedRule: 'builtin:read_only', matchedFragment: '' }
+    return { tier: 'allow', reason: 'read-only tool', matchedRule: 'builtin:read_only' }
   }
   const def: PermissionTier = policy.default_tier === 'allow' ? 'allow' : 'confirm'
   return {
     tier: def,
     reason: def === 'allow' ? 'default_tier allow' : 'default_tier confirm (unmatched mutating tool)',
     matchedRule: `default:${def}`,
-    matchedFragment: '',
   }
 }

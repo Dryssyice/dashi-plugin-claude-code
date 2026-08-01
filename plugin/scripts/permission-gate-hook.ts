@@ -147,8 +147,6 @@ export function buildConfirmRequest(args: {
   /** Rule that raised the card. Travels so the journal can name it — it used
    *  to be computed here and dropped, leaving every card anonymous. */
   readonly matchedRule?: string
-  /** Already-redacted command text the rule matched (may be empty). */
-  readonly matchedFragment?: string
   /** Working directory of the call. Two worktrees of one repo yield identical
    *  git author/committer, so the tree that acted is otherwise unrecoverable. */
   readonly cwd?: string
@@ -183,13 +181,11 @@ export function buildConfirmRequest(args: {
     preview: args.preview,
     reason: args.reason,
     matched_rule: args.matchedRule ?? '',
-    // NOT redacted again here. Round 1 called the classifier's own redactor a
-    // second time on the same bytes; a mutation run proved it: deleting this
-    // call left 415/415 green, because nothing else could ever depend on it.
-    // The classifier decides (it is the only place that still has the whole
-    // command), the journal writer guards independently (it is the only place
-    // that writes the file). A third identical call is not a fence.
-    matched_fragment: args.matchedFragment ?? '',
+    // No command text travels to the journal. The `preview` field above still
+    // carries the command, but that goes to the OPERATOR'S TELEGRAM PROMPT —
+    // a chat he reads and can delete — not to an append-only file on disk.
+    // Those are different sinks with different lifetimes, and only the second
+    // one was the problem.
     cwd: args.cwd ?? '',
     timeout_ms: timeoutMs,
   })
@@ -393,14 +389,13 @@ async function main(): Promise<void> {
   const preview = previewToolCall(toolName, ti)
   const reason = local.verdict?.reason ?? 'risky operation'
   const matchedRule = local.verdict?.matchedRule ?? ''
-  const matchedFragment = local.verdict?.matchedFragment ?? ''
   // Claude Code puts the tool call's working directory in the envelope. Prefer
   // it over process.cwd(): the hook process is not necessarily where the tool
   // will run, and the point of the field is to name the tree that acted.
   const cwd = typeof e.cwd === 'string' ? e.cwd : ''
 
   const built = buildConfirmRequest({
-    env, sessionId, toolUseId, toolName, preview, reason, matchedRule, matchedFragment, cwd,
+    env, sessionId, toolUseId, toolName, preview, reason, matchedRule, cwd,
   })
   if ('kind' in built) {
     warn(built.reason)
