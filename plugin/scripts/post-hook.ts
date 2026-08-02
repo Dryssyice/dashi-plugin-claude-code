@@ -138,8 +138,12 @@ const RETRY_DEADLINE_MAX_MS = 60_000
 export function retryDeadlineMs(env: Readonly<Record<string, string | undefined>>): number {
   const raw = env[RETRY_DEADLINE_ENV]
   if (raw === undefined) return SESSION_START_RETRY_DEADLINE_MS
-  const parsed = Number.parseInt(raw, 10)
-  if (!Number.isFinite(parsed) || parsed < 0) return SESSION_START_RETRY_DEADLINE_MS
+  // Whole decimal integers only. `Number.parseInt` accepts prefixes, and the
+  // prefixes lie in the dangerous direction: `1e9` would read as 1 ms and
+  // `0x10` as 0, i.e. a value that looks generous silently disables the retry.
+  if (!/^\d+$/.test(raw.trim())) return SESSION_START_RETRY_DEADLINE_MS
+  const parsed = Number(raw.trim())
+  if (!Number.isSafeInteger(parsed)) return SESSION_START_RETRY_DEADLINE_MS
   return Math.min(parsed, RETRY_DEADLINE_MAX_MS)
 }
 

@@ -370,6 +370,17 @@ describe('retryDeadlineMs', () => {
     expect(retryDeadlineMs({ TELEGRAM_HOOK_RETRY_DEADLINE_MS: '0' })).toBe(0)
   })
 
+  // codex review round 2: a prefix-parse fails in the dangerous direction —
+  // `1e9` reads as 1 ms, `0x10` as 0, so a value that looks generous would
+  // quietly switch the retry off.
+  test('a partially-numeric value is refused, not half-read', () => {
+    for (const raw of ['1e9', '0x10', '600ms', ' 12 34', '1.5']) {
+      expect(retryDeadlineMs({ TELEGRAM_HOOK_RETRY_DEADLINE_MS: raw })).toBe(
+        SESSION_START_RETRY_DEADLINE_MS,
+      )
+    }
+  })
+
   test('garbage and negatives fall back to the default, huge values are capped', () => {
     for (const raw of ['', 'soon', '-1']) {
       expect(retryDeadlineMs({ TELEGRAM_HOOK_RETRY_DEADLINE_MS: raw })).toBe(
