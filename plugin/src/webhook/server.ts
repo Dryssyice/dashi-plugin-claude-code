@@ -440,7 +440,19 @@ async function handleRequest(
   }
 
   // agentId, optional. If present, must match this plugin's known id.
+  //
+  // 2026-08-03: this rejection used to be SILENT — the only trace was a 404 in
+  // the caller's stderr, which nobody reads. An install-hooks.sh run that had
+  // written TELEGRAM_HOOK_AGENT_ID='<agent name>' (rather than the plugin id)
+  // therefore made EVERY hook 404 for days, and the pinned context card simply
+  // showed a dash. A misconfiguration that costs the whole hook feed has to be
+  // audible in the plugin's own log, on the side that knows the expected id.
   if (payload.agentId !== undefined && payload.agentId !== DEFAULT_AGENT_ID) {
+    log.warn('webhook agentId not recognised — hook dropped', {
+      received: payload.agentId,
+      expected: DEFAULT_AGENT_ID,
+      hint: 'install-hooks.sh --agent-id must be the plugin id, or be omitted',
+    })
     reply(res, 404, { error: `agent '${payload.agentId}' not found` })
     return
   }

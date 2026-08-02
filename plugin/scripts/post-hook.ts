@@ -19,6 +19,12 @@
 //   TELEGRAM_WEBHOOK_TOKEN   bearer token configured on the plugin
 //   TELEGRAM_HOOK_CHAT_ID    target Telegram chat id (string or numeric)
 //   TELEGRAM_HOOK_AGENT_ID   optional agent id (defaults to no agentId)
+//   TELEGRAM_HOOK_RETRY_DEADLINE_MS
+//                            optional SessionStart retry budget (default 10000)
+//
+// NOTE on TELEGRAM_HOOK_AGENT_ID: `/hooks/agent` answers 404 to any agentId it
+// does not own, so passing an AGENT's name here (rather than the plugin id)
+// silently kills the whole hook feed. Omit it unless you know the plugin id.
 
 export interface HookRequest {
   readonly url: string
@@ -74,6 +80,196 @@ export function buildHookRequest(input: BuildHookRequestInput): BuildHookRequest
     },
     body: JSON.stringify(merged),
   }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Delivery with a SessionStart-only retry (2026-08-03).
+//
+// The tmux session starts BEFORE the plugin's webhook listener accepts
+// connections — observed as `webhook fetch failed: Unable to connect` at
+// 22:38:01 against a listener that came up at 22:38:03. SessionStart is the
+// hook that carries the chat→session binding the pinned context card renders
+// from, and it fires exactly once per session, so losing that one POST leaves
+// the card blank for the whole session.
+//
+// Scope of the retry is deliberately narrow:
+//   * ONLY SessionStart. Claude WAITS for a hook to finish, so a retry budget
+//     on UserPromptSubmit / Stop / PostToolUse would be latency on every turn.
+//     Those events recur — a lost one self-heals on the next turn.
+//   * ONLY on a fetch rejection, i.e. no HTTP response at all. A status code
+//     proves the request reached the plugin; re-sending it would duplicate
+//     session-lifecycle side effects. Dedup belongs on the server side.
+// ─────────────────────────────────────────────────────────────────────
+
+// How long SessionStart keeps trying. A DEADLINE rather than a fixed list of
+// delays, because the length of the race is not ours to predict: the plugin
+// runs `await bot.init()` — a live round-trip to api.telegram.org — BEFORE
+// `startWebhookServer` (src/server.ts). On a cold start or a slow network that
+// is seconds, so a budget calibrated on one observed 2 s gap would silently be
+// too short exactly when it mattered. Paid only when nothing is listening.
+export const SESSION_START_RETRY_DEADLINE_MS = 10_000
+
+/** Capped exponential backoff between SessionStart attempts. */
+const RETRY_BACKOFF_INITIAL_MS = 250
+const RETRY_BACKOFF_MAX_MS = 2_000
+
+// NO per-attempt timeout, deliberately (both reviews, 2026-08-03). An earlier
+// draft aborted each probe after 3 s, which is precisely the way to get the
+// duplicate delivery this design forbids: `/hooks/agent` answers only AFTER the
+// memory writer, the status manager and the task mirror have run, some of which
+// call the Telegram API, so a live-but-slow plugin would be cut off mid-handler
+// and the next attempt would re-POST a SessionStart the server had already
+// accepted. An abort is indistinguishable from «never arrived» on the client
+// side, so the only safe rule is: retry only what never got a response at all.
+// The endpoint is the plugin's own loopback listener, where a refusal is
+// immediate; a hang there is no more likely than before this change and stays
+// bounded by Claude's own hook timeout.
+
+/** Override for tests and for an operator with a slow-booting plugin. */
+const RETRY_DEADLINE_ENV = 'TELEGRAM_HOOK_RETRY_DEADLINE_MS'
+const RETRY_DEADLINE_MAX_MS = 60_000
+
+/**
+ * Resolve the SessionStart retry deadline from the environment.
+ *
+ * @param env Process environment.
+ * @returns The configured deadline, or the default when unset or unusable.
+ */
+export function retryDeadlineMs(env: Readonly<Record<string, string | undefined>>): number {
+  const raw = env[RETRY_DEADLINE_ENV]
+  if (raw === undefined) return SESSION_START_RETRY_DEADLINE_MS
+  // Whole decimal integers only. `Number.parseInt` accepts prefixes, and the
+  // prefixes lie in the dangerous direction: `1e9` would read as 1 ms and
+  // `0x10` as 0, i.e. a value that looks generous silently disables the retry.
+  if (!/^\d+$/.test(raw.trim())) return SESSION_START_RETRY_DEADLINE_MS
+  const parsed = Number(raw.trim())
+  if (!Number.isSafeInteger(parsed)) return SESSION_START_RETRY_DEADLINE_MS
+  return Math.min(parsed, RETRY_DEADLINE_MAX_MS)
+}
+
+/** Hook events whose loss is terminal, so they may pay for a retry. */
+const RETRYABLE_HOOK_EVENTS: ReadonlySet<string> = new Set(['SessionStart'])
+
+const HTTP_OK_MIN = 200
+const HTTP_OK_MAX = 299
+
+/** Minimal `fetch` shape used here — keeps the seam free of DOM typings. */
+export type HookFetch = (url: string, init: RequestInit) => Promise<Response>
+
+export interface DeliverHookDeps {
+  /** Test seam; defaults to the global `fetch`. */
+  readonly fetchFn?: HookFetch
+  /** Test seam; defaults to a real `setTimeout` sleep. */
+  readonly sleep?: (ms: number) => Promise<void>
+  /** Test seam; defaults to `Date.now`. */
+  readonly now?: () => number
+  /** Test seam; defaults to the redacted stderr `warn` above. */
+  readonly warn?: (reason: string) => void
+  /** Retry deadline; defaults to {@link SESSION_START_RETRY_DEADLINE_MS}. */
+  readonly deadlineMs?: number
+}
+
+export interface DeliverHookResult {
+  /** True only for a 2xx response. */
+  readonly delivered: boolean
+  /** Attempts actually made, including the first. */
+  readonly attempts: number
+  /** Present when the last attempt produced an HTTP response. */
+  readonly status?: number
+}
+
+const realSleep = (ms: number): Promise<void> =>
+  ms <= 0 ? Promise.resolve() : new Promise((resolve) => setTimeout(resolve, ms))
+
+/** Redact anything token-shaped before a reason string can reach stderr. */
+function redactReason(err: unknown): string {
+  const msg = err instanceof Error ? err.message : String(err)
+  return `webhook fetch failed: ${msg.replace(/Bearer\s+\S+/gi, 'Bearer ***')}`
+}
+
+/**
+ * Read the Claude hook event name out of a parsed stdin envelope.
+ *
+ * Exported for tests: this one line decides whether the retry runs at all, and
+ * a mutant that hard-codes the wrong name here left the whole suite green.
+ *
+ * @param payload Parsed hook envelope.
+ * @returns The event name, or an empty string when it is not a string.
+ */
+export function resolveHookEventName(payload: Record<string, unknown>): string {
+  const name = payload.hook_event_name
+  return typeof name === 'string' ? name : ''
+}
+
+/**
+ * POST a built hook request, retrying only the events (and only the failure
+ * mode) where a retry is both safe and worth the latency. Never throws and
+ * never writes to stdout; failures produce at most one redacted stderr line.
+ *
+ * @param request Blueprint from {@link buildHookRequest}.
+ * @param hookEventName Claude's `hook_event_name` — decides the retry budget.
+ * @param deps Optional test seams for fetch, sleep, clock and warn.
+ * @returns Outcome of the last attempt plus the attempt count.
+ */
+export async function deliverHookRequest(
+  request: HookRequest,
+  hookEventName: string,
+  deps: DeliverHookDeps = {},
+): Promise<DeliverHookResult> {
+  const doFetch = deps.fetchFn ?? ((url, init) => fetch(url, init))
+  const sleep = deps.sleep ?? realSleep
+  const now = deps.now ?? Date.now
+  const emit = deps.warn ?? warn
+  const deadlineMs = deps.deadlineMs ?? SESSION_START_RETRY_DEADLINE_MS
+
+  const retryable = RETRYABLE_HOOK_EVENTS.has(hookEventName)
+  const startedAt = now()
+
+  let attempts = 0
+  let backoff = RETRY_BACKOFF_INITIAL_MS
+  let failure: string | undefined
+  let httpStatus: number | undefined
+
+  for (;;) {
+    // Retries stop once the deadline has passed; the attempt that crosses it
+    // is still made, so the budget always buys at least one try.
+    const isFinal = !retryable || now() - startedAt >= deadlineMs
+    attempts++
+
+    let outcome: Response | undefined
+    try {
+      outcome = await doFetch(request.url, {
+        method: 'POST',
+        headers: { ...request.headers },
+        body: request.body,
+      })
+    } catch (err) {
+      failure = redactReason(err)
+      if (isFinal) break
+      const remaining = deadlineMs - (now() - startedAt)
+      if (remaining <= 0) continue // deadline passed mid-attempt → final shot
+      await sleep(Math.min(backoff, remaining))
+      backoff = Math.min(backoff * 2, RETRY_BACKOFF_MAX_MS)
+      continue
+    }
+
+    if (outcome.status >= HTTP_OK_MIN && outcome.status <= HTTP_OK_MAX) {
+      return { delivered: true, attempts, status: outcome.status }
+    }
+    // An HTTP status means the plugin received it — don't re-send, or the
+    // session-lifecycle side effects run twice. Don't log the response body
+    // either: it can quote payload fields back.
+    httpStatus = outcome.status
+    failure = `webhook responded ${outcome.status}`
+    break
+  }
+
+  // Emitted OUTSIDE the try: a throwing `warn` must not be mistaken for a
+  // failed fetch and trigger a second POST.
+  emit(failure ?? 'webhook delivery failed')
+  return httpStatus === undefined
+    ? { delivered: false, attempts }
+    : { delivered: false, attempts, status: httpStatus }
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -150,23 +346,9 @@ async function main(): Promise<void> {
 
   // Narrow to HookRequest after the discriminator check.
   const request = req as HookRequest
-  try {
-    const response = await fetch(request.url, {
-      method: 'POST',
-      headers: { ...request.headers },
-      body: request.body,
-    })
-    if (!response.ok) {
-      // Don't log response body — could contain server-emitted Zod issues
-      // that quote payload fields back.
-      warn(`webhook responded ${response.status}`)
-    }
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err)
-    // grep out anything that looks like a token before logging.
-    const redacted = msg.replace(/Bearer\s+\S+/gi, 'Bearer ***')
-    warn(`webhook fetch failed: ${redacted}`)
-  }
+  await deliverHookRequest(request, resolveHookEventName(parsed as Record<string, unknown>), {
+    deadlineMs: retryDeadlineMs(process.env),
+  })
 }
 
 // Bun executes top-level await; we wrap so the script can also be imported
