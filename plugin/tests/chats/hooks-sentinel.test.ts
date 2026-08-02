@@ -309,6 +309,82 @@ describe('pre-tool-use.sh — the interpreter is chosen by checking, not by PATH
     expect(r.stdout).toContain('hook-failure')
     expect(r.stdout).toContain('no python3 with PyYAML found')
   })
+
+  // Opus review 2026-08-03, S4: the `import yaml` probe runs BEFORE stdin is
+  // captured, so it inherits the tool-call pipe. `python3 -c` does not read
+  // stdin, but a wrapper shim (pyenv, conda and asdf are shell scripts) can —
+  // and a drained pipe leaves the hook with an empty tool call, so every single
+  // call denies with hook-failure. Fail-closed, but it is the same «the agent
+  // looks broken» failure this hook was written to end.
+  withYaml('an interpreter probe that consumes stdin does not eat the tool call', () => {
+    const greedy = join(shimDir, 'greedy-python3')
+    writeFileSync(
+      greedy,
+      [
+        '#!/usr/bin/env bash',
+        '# Drains whatever stdin it is given, then behaves like a real python.',
+        'if [ "$1" = "-c" ]; then',
+        '  cat >/dev/null 2>&1',
+        'fi',
+        `exec ${YAML_PYTHON} "$@"`,
+        '',
+      ].join('\n'),
+      { encoding: 'utf8', mode: 0o755 },
+    )
+    const r = run(
+      PRE_HOOK,
+      {
+        CHATS_HOOK_PYTHON: greedy,
+        CHATS_HOOK_PYTHON_FALLBACKS: YAML_PYTHON ?? '',
+        MULTICHAT_STATE_DIR: workspace,
+        CLAUDE_WORKSPACE_DIR: workspace,
+        CHAT_ID: '164795011',
+      },
+      JSON.stringify({ tool_name: 'Bash', tool_input: { command: 'ls -la' } }),
+    )
+    // The call is allowed by the policy, so it must be allowed here too. If the
+    // probe swallowed the pipe this comes back as a hook-failure deny.
+    expect(`${r.code} ${r.stdout}`).toBe('0 ')
+  })
+
+  // Opus review 2026-08-03, S5: the header promises the pin is tried FIRST, and
+  // nothing held that promise — swapping the two candidate lines left the suite
+  // fully green. Whenever PATH's python happens to have PyYAML, an ignored pin
+  // still looks like a working pin.
+  withYaml('$CHATS_HOOK_PYTHON wins over a PATH python that also has PyYAML', () => {
+    // A pin that HAS yaml (it delegates the probe) but is unmistakable when it
+    // is the one that actually runs the policy.
+    const pin = join(shimDir, 'pinned-python3')
+    writeFileSync(
+      pin,
+      [
+        '#!/usr/bin/env bash',
+        'if [ "$1" = "-c" ]; then',
+        `  exec ${YAML_PYTHON} "$@"`,
+        'fi',
+        'printf \'%s\\n\' \'{"decision":"block","denied_by":"PINNED","reason":"the pinned interpreter ran"}\'',
+        'exit 2',
+        '',
+      ].join('\n'),
+      { encoding: 'utf8', mode: 0o755 },
+    )
+    const r = run(
+      PRE_HOOK,
+      {
+        // PATH's python3 is the host's yaml-capable one, so the pin can only
+        // win on ORDER, never because it is the sole candidate.
+        PATH: `${join(YAML_PYTHON as string, '..')}:/bin:/usr/bin`,
+        CHATS_HOOK_PYTHON: pin,
+        CHATS_HOOK_PYTHON_FALLBACKS: YAML_PYTHON ?? '',
+        MULTICHAT_STATE_DIR: workspace,
+        CLAUDE_WORKSPACE_DIR: workspace,
+        CHAT_ID: '164795011',
+      },
+      JSON.stringify({ tool_name: 'Bash', tool_input: { command: 'ls -la' } }),
+    )
+    expect(r.code).toBe(2)
+    expect(JSON.parse(r.stdout).denied_by).toBe('PINNED')
+  })
 })
 
 describe('pre-tool-use.sh — a block says which kind of block it is', () => {
@@ -339,6 +415,69 @@ describe('pre-tool-use.sh — a block says which kind of block it is', () => {
     )
     expect(r.code).toBe(2)
     expect(JSON.parse(r.stdout).denied_by).toBe('hook-failure')
+  })
+
+  // Opus review 2026-08-03, S2: `denied_by` was set on every deny path in the
+  // source, and the suite held only four of them. Two mutants survived a full
+  // green run — including one that relabelled a hook failure as a policy
+  // verdict, which is precisely the confusion this field exists to remove.
+  test('every deny path carries denied_by, including the earliest ones', () => {
+    const cases: ReadonlyArray<readonly [string, Record<string, string>, string]> = [
+      [
+        'CHAT_ID missing',
+        { MULTICHAT_STATE_DIR: '@ws', CLAUDE_WORKSPACE_DIR: '@ws' },
+        'hook-failure',
+      ],
+      [
+        'no interpreter with PyYAML',
+        {
+          MULTICHAT_STATE_DIR: '@ws',
+          CLAUDE_WORKSPACE_DIR: '@ws',
+          CHAT_ID: '164795011',
+          CHATS_HOOK_PYTHON: '/nonexistent/python3',
+          CHATS_HOOK_PYTHON_FALLBACKS: '',
+          // /bin has bash (so the script runs) and no python3 (so the search
+          // finds nothing) — the branch is otherwise unreachable.
+          PATH: '/bin',
+        },
+        'hook-failure',
+      ],
+    ]
+    for (const [label, rawEnv, expected] of cases) {
+      const env: Record<string, string> = {}
+      for (const [k, v] of Object.entries(rawEnv)) env[k] = v === '@ws' ? workspace : v
+      const r = run(
+        PRE_HOOK,
+        env,
+        JSON.stringify({ tool_name: 'Bash', tool_input: { command: 'ls' } }),
+      )
+      expect(`${label}: ${r.code}`).toBe(`${label}: 2`)
+      expect(`${label}: ${JSON.parse(r.stdout).denied_by}`).toBe(`${label}: ${expected}`)
+    }
+  })
+
+  // Opus review 2026-08-03, S3. Under the exit-2 contract Claude surfaces
+  // STDERR to the model; the JSON on stdout is the exit-0 form. The hook exited
+  // 2 and printed only stdout, so every block reached the model with no reason
+  // attached — the field this commit is about was invisible to its reader.
+  test('the refusal reaches stderr too, or the model is blocked without a reason', () => {
+    const denials: ReadonlyArray<readonly [string, Record<string, string>]> = [
+      ['policy deny', { MULTICHAT_STATE_DIR: '@ws', CLAUDE_WORKSPACE_DIR: '@ws', CHAT_ID: '164795011' }],
+      ['CHAT_ID missing', { MULTICHAT_STATE_DIR: '@ws', CLAUDE_WORKSPACE_DIR: '@ws' }],
+    ]
+    for (const [label, rawEnv] of denials) {
+      const env: Record<string, string> = {}
+      for (const [k, v] of Object.entries(rawEnv)) env[k] = v === '@ws' ? workspace : v
+      const r = run(
+        PRE_HOOK,
+        env,
+        JSON.stringify({ tool_name: 'Bash', tool_input: { command: 'rm -rf /' } }),
+      )
+      expect(`${label}: ${r.code}`).toBe(`${label}: 2`)
+      expect(`${label}: ${r.stderr.includes('BLOCKED')}`).toBe(`${label}: true`)
+      // …and it says WHICH kind of block, in the stream the model reads.
+      expect(r.stderr).toMatch(/BLOCKED \((policy|hook-failure)\)/)
+    }
   })
 
   test('an unparseable policy is tagged hook-failure, not a policy verdict', () => {

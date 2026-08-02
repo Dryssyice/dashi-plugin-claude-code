@@ -29,6 +29,16 @@
 
 set -euo pipefail
 
+# Refuse, on BOTH streams. Under the exit-2 contract Claude surfaces STDERR to
+# the model as the reason; the JSON on stdout is the machine-readable form an
+# exit-0 hook would use. Printing only stdout, as this hook did, meant the model
+# was blocked with no reason attached.
+deny() {  # deny <denied_by> <reason>
+  printf '{"decision":"block","denied_by":"%s","reason":"%s"}\n' "$1" "$2"
+  printf 'BLOCKED (%s): %s\n' "$1" "$2" >&2
+  exit 2
+}
+
 # Sentinel: this hook is multichat-specific. If MULTICHAT_STATE_DIR is unset
 # the hook is running outside a per-chat tmux session (e.g. accidentally
 # registered into the master Thrall workspace via a stray settings.json) and
@@ -40,16 +50,14 @@ fi
 
 # Fail-safe: CHAT_ID missing -> full deny.
 if [[ -z "${CHAT_ID:-}" ]]; then
-  printf '%s\n' '{"decision":"block","denied_by":"hook-failure","reason":"CHAT_ID env var missing (fail-safe deny)"}'
-  exit 2
+  deny hook-failure 'CHAT_ID env var missing (fail-safe deny)'
 fi
 
 WORKSPACE="${CLAUDE_WORKSPACE_DIR:-${HOME}/.claude-lab/thrall/.claude}"
 POLICY_PATH="${WORKSPACE}/chats/policy.yaml"
 
 if [[ ! -f "$POLICY_PATH" ]]; then
-  printf '%s\n' '{"decision":"block","denied_by":"hook-failure","reason":"policy.yaml not found (fail-safe deny)"}'
-  exit 2
+  deny hook-failure 'policy.yaml not found (fail-safe deny)'
 fi
 
 # Pick an interpreter that can actually read the policy.
@@ -75,6 +83,11 @@ fi
 CHATS_HOOK_PYTHON_FALLBACKS="${CHATS_HOOK_PYTHON_FALLBACKS-/usr/bin/python3 /opt/homebrew/bin/python3 /usr/local/bin/python3}"
 
 POLICY_PYTHON=""
+# `set -f` for the loop only: the fallback list is unquoted ON PURPOSE, because
+# it must word-split into candidates -- but unquoted also means pathname
+# expansion, so a list containing `*` or `?` would be globbed against the
+# current directory. Word splitting is wanted, globbing is not.
+set -f
 for candidate in \
   "${CHATS_HOOK_PYTHON:-}" \
   "$(command -v python3 2>/dev/null || true)" \
@@ -82,19 +95,25 @@ for candidate in \
 do
   [[ -n "$candidate" ]] || continue
   [[ -x "$candidate" ]] || continue
-  if "$candidate" -c 'import yaml' >/dev/null 2>&1; then
+  # `</dev/null` matters: this probe runs BEFORE stdin is captured below, so it
+  # inherits the tool-call pipe. `python3 -c` does not read stdin, but a wrapper
+  # shim (pyenv, conda, asdf are shell scripts) can, and a drained pipe would
+  # leave `cat > "$TMP_INPUT"` with an empty file -- turning every tool call
+  # into a hook-failure deny. Fail-closed, but it is the same failure this hook
+  # was written to end, re-entered through another door.
+  if "$candidate" -c 'import yaml' >/dev/null 2>&1 </dev/null; then
     POLICY_PYTHON="$candidate"
     break
   fi
 done
+set +f
 
 if [[ -z "$POLICY_PYTHON" ]]; then
   # Still a deny -- an unreadable policy must not become an open door. But the
   # reason now says which of the two things happened. «The policy forbids this»
   # and «I could not read the policy» are different events with different fixes,
   # and until now both arrived as an opaque block.
-  printf '%s\n' '{"decision":"block","denied_by":"hook-failure","reason":"no python3 with PyYAML found (tried $CHATS_HOOK_PYTHON, PATH, then $CHATS_HOOK_PYTHON_FALLBACKS) — the chat policy could not be read, so nothing was evaluated"}'
-  exit 2
+  deny hook-failure 'no python3 with PyYAML found (tried $CHATS_HOOK_PYTHON, PATH, then $CHATS_HOOK_PYTHON_FALLBACKS) — the chat policy could not be read, so nothing was evaluated'
 fi
 
 # Capture stdin into a temp file. Pass the path via env so python reads
@@ -113,6 +132,24 @@ import os
 import sys
 
 
+def emit(denied_by: str, reason: str) -> None:
+    """Write the refusal to BOTH streams, because they reach different readers.
+
+    Under the exit-2 contract Claude surfaces STDERR to the model as the reason
+    the call was blocked; the JSON-on-stdout form is what an exit-0 hook uses.
+    This hook exits 2 and printed only stdout, so the model saw a block with no
+    reason at all -- the whole point of `denied_by` reached a human reading raw
+    hook output and nobody else. Stdout keeps the machine-readable shape, stderr
+    carries the same two facts in words.
+    """
+    sys.stdout.write(
+        json.dumps({'decision': 'block', 'denied_by': denied_by, 'reason': reason}) + '\n'
+    )
+    sys.stdout.flush()
+    sys.stderr.write(f'BLOCKED ({denied_by}): {reason}\n')
+    sys.stderr.flush()
+
+
 def emit_block(reason: str, denied_by: str = 'policy') -> None:
     """Refuse the call, saying WHICH kind of refusal this is.
 
@@ -123,7 +160,7 @@ def emit_block(reason: str, denied_by: str = 'policy') -> None:
     apart eventually treats every block as a policy decision and stops looking
     for the broken install underneath.
     """
-    print(json.dumps({'decision': 'block', 'denied_by': denied_by, 'reason': reason}))
+    emit(denied_by, reason)
     sys.exit(2)
 
 
@@ -138,17 +175,7 @@ def deny_on_crash(exc_type, exc, tb) -> None:  # noqa: ANN001 — sys.excepthook
     leave with 1. The exception itself is NOT printed: it can quote the policy
     or the tool call back at the caller.
     """
-    sys.stdout.write(
-        json.dumps(
-            {
-                'decision': 'block',
-                'denied_by': 'hook-failure',
-                'reason': f'hook crashed ({exc_type.__name__}) — nothing was evaluated',
-            }
-        )
-        + '\n'
-    )
-    sys.stdout.flush()
+    emit('hook-failure', f'hook crashed ({exc_type.__name__}) — nothing was evaluated')
     os._exit(2)
 
 
