@@ -4,11 +4,14 @@
 // 2026-08-03: plus `deliverHookRequest`, which owns the SessionStart retry.
 
 import { describe, expect, test } from 'bun:test'
+import { spawnSync } from 'child_process'
+import { join } from 'path'
 
 import {
   buildHookRequest,
   deliverHookRequest,
   resolveHookEventName,
+  retryDeadlineMs,
   SESSION_START_RETRY_DEADLINE_MS,
   type HookRequest,
 } from '../../scripts/post-hook.js'
@@ -265,12 +268,15 @@ describe('deliverHookRequest', () => {
     expect(h.warnings.length).toBe(1)
   })
 
-  test('every probe is time-capped, and the last attempt is not', async () => {
+  // Both reviews, 2026-08-03: an abort is indistinguishable from «never
+  // arrived», so a per-attempt timeout would re-POST a SessionStart the plugin
+  // had already accepted but was still handling (it answers only after the
+  // memory writer / status manager / task mirror have run).
+  test('no attempt is ever aborted — an abort would look like a lost request', async () => {
     const h = harness(() => connRefused())
     await deliverHookRequest(REQUEST, 'SessionStart', h)
-    const last = h.attempts[h.attempts.length - 1]
-    expect(last?.aborted).toBe(false)
-    expect(h.attempts.slice(0, -1).every((a) => a.aborted)).toBe(true)
+    expect(h.attempts.length).toBeGreaterThan(1)
+    expect(h.attempts.some((a) => a.aborted)).toBe(false)
   })
 
   test('backoff grows and stays capped', async () => {
@@ -354,5 +360,92 @@ describe('resolveHookEventName', () => {
     const result = await deliverHookRequest(REQUEST, resolveHookEventName(parsed), h)
     expect(result.delivered).toBe(true)
     expect(h.attempts.length).toBeGreaterThan(1)
+  })
+})
+
+describe('retryDeadlineMs', () => {
+  test('defaults when unset, honours a valid override', () => {
+    expect(retryDeadlineMs({})).toBe(SESSION_START_RETRY_DEADLINE_MS)
+    expect(retryDeadlineMs({ TELEGRAM_HOOK_RETRY_DEADLINE_MS: '400' })).toBe(400)
+    expect(retryDeadlineMs({ TELEGRAM_HOOK_RETRY_DEADLINE_MS: '0' })).toBe(0)
+  })
+
+  test('garbage and negatives fall back to the default, huge values are capped', () => {
+    for (const raw of ['', 'soon', '-1']) {
+      expect(retryDeadlineMs({ TELEGRAM_HOOK_RETRY_DEADLINE_MS: raw })).toBe(
+        SESSION_START_RETRY_DEADLINE_MS,
+      )
+    }
+    expect(retryDeadlineMs({ TELEGRAM_HOOK_RETRY_DEADLINE_MS: '999999999' })).toBeLessThanOrEqual(
+      60_000,
+    )
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────
+// End-to-end through the script's PUBLIC entry (stdin + env + exit code).
+//
+// codex review 2026-08-03: every test above drives the exported helper, so
+// `main()` could be rewired to a plain one-shot fetch and the suite would stay
+// green. These run the real file against a dead port.
+// ─────────────────────────────────────────────────────────────────────
+
+/** A port nothing listens on — a connect there is refused immediately. */
+const DEAD_PORT = 8099
+const E2E_DEADLINE_MS = 600
+
+interface ScriptRun {
+  readonly code: number
+  readonly stdout: string
+  readonly stderr: string
+  readonly ms: number
+}
+
+function runScript(hookEventName: string): ScriptRun {
+  const script = join(import.meta.dir, '..', '..', 'scripts', 'post-hook.ts')
+  const payload = JSON.stringify({
+    hook_event_name: hookEventName,
+    session_id: 's-e2e',
+    transcript_path: '/tmp/t.jsonl',
+    cwd: '/tmp',
+  })
+  const startedAt = Date.now()
+  const r = spawnSync(process.execPath, [script], {
+    input: payload,
+    encoding: 'utf8',
+    env: {
+      PATH: process.env.PATH ?? '/usr/bin:/bin',
+      HOME: process.env.HOME ?? '/tmp',
+      TELEGRAM_HOOK_CHAT_ID: '1',
+      TELEGRAM_WEBHOOK_URL: `http://127.0.0.1:${DEAD_PORT}/hooks/agent`,
+      TELEGRAM_WEBHOOK_TOKEN: 'e2e-secret-token',
+      TELEGRAM_HOOK_RETRY_DEADLINE_MS: String(E2E_DEADLINE_MS),
+    },
+  })
+  return {
+    code: r.status ?? -1,
+    stdout: r.stdout ?? '',
+    stderr: r.stderr ?? '',
+    ms: Date.now() - startedAt,
+  }
+}
+
+describe('post-hook.ts — public entry', () => {
+  test('SessionStart against a dead port retries, still exits 0 with empty stdout', () => {
+    const r = runScript('SessionStart')
+    expect(r.code).toBe(0)
+    expect(r.stdout).toBe('')
+    // It kept trying for the whole (shortened) budget instead of giving up on
+    // the first refusal — the behaviour the fix exists for.
+    expect(r.ms).toBeGreaterThanOrEqual(E2E_DEADLINE_MS)
+    expect(r.stderr).not.toContain('e2e-secret-token')
+  })
+
+  test('Stop against the same dead port gives up at once', () => {
+    const r = runScript('Stop')
+    expect(r.code).toBe(0)
+    expect(r.stdout).toBe('')
+    expect(r.ms).toBeLessThan(E2E_DEADLINE_MS)
+    expect(r.stderr).not.toContain('e2e-secret-token')
   })
 })

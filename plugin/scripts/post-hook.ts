@@ -19,6 +19,12 @@
 //   TELEGRAM_WEBHOOK_TOKEN   bearer token configured on the plugin
 //   TELEGRAM_HOOK_CHAT_ID    target Telegram chat id (string or numeric)
 //   TELEGRAM_HOOK_AGENT_ID   optional agent id (defaults to no agentId)
+//   TELEGRAM_HOOK_RETRY_DEADLINE_MS
+//                            optional SessionStart retry budget (default 10000)
+//
+// NOTE on TELEGRAM_HOOK_AGENT_ID: `/hooks/agent` answers 404 to any agentId it
+// does not own, so passing an AGENT's name here (rather than the plugin id)
+// silently kills the whole hook feed. Omit it unless you know the plugin id.
 
 export interface HookRequest {
   readonly url: string
@@ -107,13 +113,35 @@ export const SESSION_START_RETRY_DEADLINE_MS = 10_000
 const RETRY_BACKOFF_INITIAL_MS = 250
 const RETRY_BACKOFF_MAX_MS = 2_000
 
-// Per-attempt cap while we are still probing. NOT applied to the final attempt:
-// `/hooks/agent` answers only after the memory writer, the status manager and
-// the task mirror have run (src/webhook/server.ts), some of which call the
-// Telegram API — so a slow-but-alive plugin must still get one untimed shot.
-// Without this cap a host that black-holes packets would burn the OS connect
-// timeout (~75 s on darwin) per attempt and blow Claude's own hook timeout.
-const RETRY_PROBE_TIMEOUT_MS = 3_000
+// NO per-attempt timeout, deliberately (both reviews, 2026-08-03). An earlier
+// draft aborted each probe after 3 s, which is precisely the way to get the
+// duplicate delivery this design forbids: `/hooks/agent` answers only AFTER the
+// memory writer, the status manager and the task mirror have run, some of which
+// call the Telegram API, so a live-but-slow plugin would be cut off mid-handler
+// and the next attempt would re-POST a SessionStart the server had already
+// accepted. An abort is indistinguishable from «never arrived» on the client
+// side, so the only safe rule is: retry only what never got a response at all.
+// The endpoint is the plugin's own loopback listener, where a refusal is
+// immediate; a hang there is no more likely than before this change and stays
+// bounded by Claude's own hook timeout.
+
+/** Override for tests and for an operator with a slow-booting plugin. */
+const RETRY_DEADLINE_ENV = 'TELEGRAM_HOOK_RETRY_DEADLINE_MS'
+const RETRY_DEADLINE_MAX_MS = 60_000
+
+/**
+ * Resolve the SessionStart retry deadline from the environment.
+ *
+ * @param env Process environment.
+ * @returns The configured deadline, or the default when unset or unusable.
+ */
+export function retryDeadlineMs(env: Readonly<Record<string, string | undefined>>): number {
+  const raw = env[RETRY_DEADLINE_ENV]
+  if (raw === undefined) return SESSION_START_RETRY_DEADLINE_MS
+  const parsed = Number.parseInt(raw, 10)
+  if (!Number.isFinite(parsed) || parsed < 0) return SESSION_START_RETRY_DEADLINE_MS
+  return Math.min(parsed, RETRY_DEADLINE_MAX_MS)
+}
 
 /** Hook events whose loss is terminal, so they may pay for a retry. */
 const RETRYABLE_HOOK_EVENTS: ReadonlySet<string> = new Set(['SessionStart'])
@@ -133,6 +161,8 @@ export interface DeliverHookDeps {
   readonly now?: () => number
   /** Test seam; defaults to the redacted stderr `warn` above. */
   readonly warn?: (reason: string) => void
+  /** Retry deadline; defaults to {@link SESSION_START_RETRY_DEADLINE_MS}. */
+  readonly deadlineMs?: number
 }
 
 export interface DeliverHookResult {
@@ -186,6 +216,7 @@ export async function deliverHookRequest(
   const sleep = deps.sleep ?? realSleep
   const now = deps.now ?? Date.now
   const emit = deps.warn ?? warn
+  const deadlineMs = deps.deadlineMs ?? SESSION_START_RETRY_DEADLINE_MS
 
   const retryable = RETRYABLE_HOOK_EVENTS.has(hookEventName)
   const startedAt = now()
@@ -196,25 +227,22 @@ export async function deliverHookRequest(
   let httpStatus: number | undefined
 
   for (;;) {
-    // The attempt is "final" when no retry may follow it — that one runs
-    // untimed, every earlier probe carries RETRY_PROBE_TIMEOUT_MS.
-    const elapsed = now() - startedAt
-    const isFinal = !retryable || elapsed >= SESSION_START_RETRY_DEADLINE_MS
+    // Retries stop once the deadline has passed; the attempt that crosses it
+    // is still made, so the budget always buys at least one try.
+    const isFinal = !retryable || now() - startedAt >= deadlineMs
     attempts++
 
     let outcome: Response | undefined
     try {
-      const init: RequestInit = {
+      outcome = await doFetch(request.url, {
         method: 'POST',
         headers: { ...request.headers },
         body: request.body,
-      }
-      if (!isFinal) init.signal = AbortSignal.timeout(RETRY_PROBE_TIMEOUT_MS)
-      outcome = await doFetch(request.url, init)
+      })
     } catch (err) {
       failure = redactReason(err)
       if (isFinal) break
-      const remaining = SESSION_START_RETRY_DEADLINE_MS - (now() - startedAt)
+      const remaining = deadlineMs - (now() - startedAt)
       if (remaining <= 0) continue // deadline passed mid-attempt → final shot
       await sleep(Math.min(backoff, remaining))
       backoff = Math.min(backoff * 2, RETRY_BACKOFF_MAX_MS)
@@ -314,7 +342,9 @@ async function main(): Promise<void> {
 
   // Narrow to HookRequest after the discriminator check.
   const request = req as HookRequest
-  await deliverHookRequest(request, resolveHookEventName(parsed as Record<string, unknown>))
+  await deliverHookRequest(request, resolveHookEventName(parsed as Record<string, unknown>), {
+    deadlineMs: retryDeadlineMs(process.env),
+  })
 }
 
 // Bun executes top-level await; we wrap so the script can also be imported
