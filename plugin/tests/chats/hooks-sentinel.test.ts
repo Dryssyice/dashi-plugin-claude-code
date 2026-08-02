@@ -355,7 +355,78 @@ describe('pre-tool-use.sh — a block says which kind of block it is', () => {
     expect(r.code).toBe(2)
     const payload = JSON.parse(r.stdout)
     expect(payload.denied_by).toBe('hook-failure')
-    expect(payload.reason).toContain('policy load failed')
+    expect(payload.reason).toContain('did not parse')
+  })
+
+  // codex review 2026-08-03, MUST. A policy can be perfectly valid YAML and
+  // still be the wrong SHAPE. Those shapes used to reach `.get()` on a non-dict,
+  // raise AttributeError and exit 1 — and Claude blocks on exit 2 and ONLY on
+  // exit 2, so the fail-safe hook was failing OPEN in the corner it exists for.
+  // The old suite could not see it: it tested torn YAML, never wrong-shaped YAML.
+  const MISSHAPEN: ReadonlyArray<readonly [string, string]> = [
+    ['a top-level list', '- one\n- two\n'],
+    ['a top-level scalar', 'just a string\n'],
+    ['chats as a list', 'version: 1\nchats:\n  - "164795011"\n'],
+    ['the chat entry as a list', 'version: 1\nchats:\n  "164795011":\n    - deny\n'],
+    [
+      'the deny block as a list',
+      'version: 1\nchats:\n  "164795011":\n    deny:\n      - rm -rf /\n',
+    ],
+    [
+      'a deny list given as a bare string',
+      'version: 1\nchats:\n  "164795011":\n    deny:\n      bash_patterns: "ls"\n',
+    ],
+  ]
+
+  for (const [label, yaml] of MISSHAPEN) {
+    test(`valid YAML with ${label} denies, and says the hook failed`, () => {
+      writeFileSync(policyPath, yaml, 'utf8')
+      const r = run(
+        PRE_HOOK,
+        {
+          MULTICHAT_STATE_DIR: workspace,
+          CLAUDE_WORKSPACE_DIR: workspace,
+          CHAT_ID: '164795011',
+        },
+        JSON.stringify({ tool_name: 'Bash', tool_input: { command: 'ls' } }),
+      )
+      // Exit 2 is the only code Claude reads as «blocked».
+      expect(r.code).toBe(2)
+      const payload = JSON.parse(r.stdout)
+      expect(payload.decision).toBe('block')
+      expect(payload.denied_by).toBe('hook-failure')
+    })
+  }
+
+  // Same class as the plugin's `matched_fragment` leak: a refusal must not hand
+  // back a piece of the policy. The rule is named by kind and position instead.
+  test('a policy deny names the rule, never the rule text', () => {
+    writeFileSync(
+      policyPath,
+      [
+        'version: 1',
+        'chats:',
+        '  "164795011":',
+        '    deny:',
+        '      bash_patterns:',
+        '        - "sekrit-path-fragment"',
+        '',
+      ].join('\n'),
+      'utf8',
+    )
+    const r = run(
+      PRE_HOOK,
+      {
+        MULTICHAT_STATE_DIR: workspace,
+        CLAUDE_WORKSPACE_DIR: workspace,
+        CHAT_ID: '164795011',
+      },
+      JSON.stringify({ tool_name: 'Bash', tool_input: { command: 'echo sekrit-path-fragment' } }),
+    )
+    expect(r.code).toBe(2)
+    expect(r.stdout).not.toContain('sekrit-path-fragment')
+    expect(r.stdout).toContain('bash_patterns deny')
+    expect(JSON.parse(r.stdout).denied_by).toBe('policy')
   })
 })
 

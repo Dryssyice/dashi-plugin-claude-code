@@ -127,6 +127,33 @@ def emit_block(reason: str, denied_by: str = 'policy') -> None:
     sys.exit(2)
 
 
+def deny_on_crash(exc_type, exc, tb) -> None:  # noqa: ANN001 — sys.excepthook shape
+    """Any unhandled exception becomes a BLOCK, not a pass.
+
+    Claude treats exit 2 as «blocked» and every other code as «allowed», so an
+    interpreter that dies on an unexpected input exits 1 and the call goes
+    through -- a fail-safe hook failing open. Named guards below close the
+    shapes we know about; this closes the ones we do not. `os._exit` because
+    `sys.exit` inside an excepthook is swallowed and the process would still
+    leave with 1. The exception itself is NOT printed: it can quote the policy
+    or the tool call back at the caller.
+    """
+    sys.stdout.write(
+        json.dumps(
+            {
+                'decision': 'block',
+                'denied_by': 'hook-failure',
+                'reason': f'hook crashed ({exc_type.__name__}) — nothing was evaluated',
+            }
+        )
+        + '\n'
+    )
+    sys.stdout.flush()
+    os._exit(2)
+
+
+sys.excepthook = deny_on_crash
+
 chat_id = os.environ.get('CHAT_ID', '')
 policy_path = os.environ.get('POLICY_PATH', '')
 tmp_input_path = os.environ.get('TMP_INPUT_PATH', '')
@@ -134,8 +161,10 @@ tmp_input_path = os.environ.get('TMP_INPUT_PATH', '')
 try:
     with open(tmp_input_path, 'r', encoding='utf-8') as f:
         tool_call = json.load(f)
-except Exception as e:  # noqa: BLE001
-    emit_block(f'tool-call json unreadable: {e}', 'hook-failure')
+except Exception:  # noqa: BLE001
+    # Type only: a decoder message can quote the offending text back, and the
+    # offending text here is the tool call.
+    emit_block('tool-call json unreadable (fail-safe deny)', 'hook-failure')
 
 try:
     import yaml  # type: ignore
@@ -148,12 +177,49 @@ except ImportError:
 
 try:
     with open(policy_path, 'r', encoding='utf-8') as f:
-        policy = yaml.safe_load(f) or {}
-except Exception as e:  # noqa: BLE001
-    emit_block(f'policy load failed: {e}', 'hook-failure')
+        policy = yaml.safe_load(f)
+except Exception:  # noqa: BLE001
+    # The parser's message quotes the offending LINE of policy.yaml. That line
+    # is policy content and has no business in the caller's transcript, so the
+    # exception is named by type only.
+    emit_block('policy.yaml did not parse (fail-safe deny)', 'hook-failure')
 
-chat_cfg = (policy.get('chats') or {}).get(chat_id) or {}
-deny = chat_cfg.get('deny') or {}
+
+def as_mapping(value: object, what: str) -> dict:
+    """Return ``value`` as a dict, denying if it is anything else.
+
+    A policy can be perfectly valid YAML and still be the wrong SHAPE -- a top
+    level list, `chats: []`, `deny: []`. Before this guard those shapes reached
+    `.get()` on a non-dict, raised AttributeError and killed the interpreter
+    with exit code 1. Claude blocks on exit 2 and ONLY on exit 2, so the
+    fail-safe hook was failing OPEN in exactly the corner it exists for. An
+    absent key is different and stays allowed: no rules for this chat has
+    always meant no denials.
+    """
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        emit_block(f'{what} is not a mapping (fail-safe deny)', 'hook-failure')
+    return value
+
+
+def as_sequence(value: object, what: str) -> list:
+    """Return ``value`` as a list, denying if it is anything else.
+
+    A bare string here would iterate CHARACTER by character and quietly match
+    almost nothing -- a deny list that silently stops denying.
+    """
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        emit_block(f'{what} is not a list (fail-safe deny)', 'hook-failure')
+    return value
+
+
+policy = as_mapping(policy, 'policy.yaml root')
+chats = as_mapping(policy.get('chats'), 'policy.yaml chats')
+chat_cfg = as_mapping(chats.get(chat_id), 'the chat entry')
+deny = as_mapping(chat_cfg.get('deny'), 'the deny block')
 
 # Defensive: tool_call may be malformed under prompt injection.
 tool_name = ''
@@ -166,38 +232,46 @@ if isinstance(tool_call, dict):
     if isinstance(raw_input, dict):
         tool_input = raw_input
 
+# A refusal names the RULE, never the rule's text. The pattern comes out of
+# policy.yaml and can carry a path or a token fragment; printing it hands the
+# caller a piece of the policy on every block. The rule kind plus its 1-based
+# position is enough to find the line in policy.yaml, and carries nothing.
+def rule_ref(section: str, index: int) -> str:
+    return f'{section} deny: rule #{index + 1} in policy.yaml'
+
+
 # 1) mcp_tools / tool-name deny — fnmatch globs.
-for pattern in (deny.get('mcp_tools') or []):
+for i, pattern in enumerate(as_sequence(deny.get('mcp_tools'), 'mcp_tools')):
     if isinstance(pattern, str) and fnmatch.fnmatch(tool_name, pattern):
-        emit_block(f'mcp_tools deny: {pattern}')
+        emit_block(rule_ref('mcp_tools', i))
 
 # 2) read_paths — only for tools that take a file path.
 PATH_TOOLS = {'Read', 'Edit', 'Write', 'NotebookEdit'}
 if tool_name in PATH_TOOLS:
     candidate = tool_input.get('file_path') or tool_input.get('notebook_path') or ''
     if isinstance(candidate, str) and candidate:
-        for pattern in (deny.get('read_paths') or []):
+        for i, pattern in enumerate(as_sequence(deny.get('read_paths'), 'read_paths')):
             if not isinstance(pattern, str):
                 continue
             if fnmatch.fnmatch(candidate, pattern):
-                emit_block(f'read_paths deny: {pattern}')
+                emit_block(rule_ref('read_paths', i))
 
 # 3) bash_patterns — substring by default, fnmatch when meta present.
 if tool_name == 'Bash':
     command = tool_input.get('command') or ''
     if isinstance(command, str):
         cmd_lower = command.lower()
-        for pattern in (deny.get('bash_patterns') or []):
+        for i, pattern in enumerate(as_sequence(deny.get('bash_patterns'), 'bash_patterns')):
             if not isinstance(pattern, str):
                 continue
             pat_lower = pattern.lower()
             has_meta = any(ch in pat_lower for ch in '*?[')
             if has_meta:
                 if fnmatch.fnmatch(cmd_lower, pat_lower):
-                    emit_block(f'bash_patterns deny: {pattern}')
+                    emit_block(rule_ref('bash_patterns', i))
             else:
                 if pat_lower in cmd_lower:
-                    emit_block(f'bash_patterns deny: {pattern}')
+                    emit_block(rule_ref('bash_patterns', i))
 
 # Default allow.
 sys.exit(0)
