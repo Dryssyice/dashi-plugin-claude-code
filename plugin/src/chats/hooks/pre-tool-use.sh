@@ -265,10 +265,16 @@ def validated_deny(raw_policy: object, wanted_chat: str) -> dict:
     # remove, reintroduced by the order of two statements.
     lists: dict = {name: [] for name in DENY_KEYS}
 
-    # EVERY chat is validated, not just the one calling. The TypeScript loader
-    # is strict over the whole file, so a file it would reject must not be a
-    # file this hook accepts -- if the two disagree, the session comes up under
-    # a policy the gate reads differently from the server that loaded it.
+    # EVERY chat's DENY BLOCK is validated, not just the calling chat's. A file
+    # the TypeScript loader would reject must not be a file this hook accepts --
+    # if the two disagree, the session comes up under a policy the gate reads
+    # differently from the server that loaded it.
+    #
+    # The deny block only, and deliberately: the rest of a chat entry (mode,
+    # persona_file, ttl…) is the loader's schema, it is enforced at load time
+    # before any session exists, and restating it here would be the same schema
+    # in two languages drifting apart. What this hook enforces is what this hook
+    # acts on.
     #
     # The cost is real and belongs in the open: one malformed entry anywhere
     # locks every chat until the file is fixed. That is the same direction the
@@ -276,15 +282,26 @@ def validated_deny(raw_policy: object, wanted_chat: str) -> dict:
     # nobody can parse is the thing being avoided.
     for key, value in chats_map.items():
         where = f'chat {key}'
+        # `chats:\n  "999":` -- a key with nothing after it -- is `None` here,
+        # and skipping it was the same fail-open one shape smaller: a crooked
+        # record anywhere in the file went unmentioned while the rule claimed
+        # every chat is validated. The TypeScript schema does not accept null
+        # for an entry either.
         if value is None:
+            problems.append(f'{where}: entry has no value')
             continue
         if not isinstance(value, dict):
             problems.append(f'{where}: entry is not a mapping')
             continue
 
-        deny_map = value.get('deny')
-        if deny_map is None:
-            deny_map = {}
+        # An ABSENT `deny` is legitimate -- no rules for this chat has always
+        # meant no denials. A `deny:` written with no value is not the same
+        # thing: it is a half-typed rule block, and `.get()` cannot tell the two
+        # apart, so the key is asked for by name.
+        if 'deny' in value and value['deny'] is None:
+            problems.append(f'{where}: deny has no value')
+            continue
+        deny_map = value.get('deny', {})
         if not isinstance(deny_map, dict):
             problems.append(f'{where}: deny is not a mapping')
             continue

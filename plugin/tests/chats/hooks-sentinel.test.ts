@@ -792,10 +792,44 @@ describe('pre-tool-use.sh — a block says which kind of block it is', () => {
   // a policy the gate reads differently from the server that loaded it. The
   // cost is stated rather than hidden: one malformed entry anywhere locks every
   // chat until the file is fixed.
-  test("another chat's broken entry denies this chat too", () => {
+  const OTHER_CHAT_BROKEN: ReadonlyArray<readonly [string, string]> = [
+    ['a deny list of the wrong type', '    deny:\n      read_paths: "not-a-list"\n'],
+    ['an entry with no value at all', ''],
+    ['a deny block with no value', '    deny:\n'],
+    ['an entry that is a list', '    - deny\n'],
+  ]
+
+  for (const [label, tail] of OTHER_CHAT_BROKEN) {
+    test(`another chat's broken entry denies this chat too: ${label}`, () => {
+      writeFileSync(
+        policyPath,
+        'version: 1\nchats:\n  "164795011":\n    deny:\n      bash_patterns:\n        - "rm"\n  "999":\n' +
+          tail,
+        'utf8',
+      )
+      const r = run(
+        PRE_HOOK,
+        {
+          MULTICHAT_STATE_DIR: workspace,
+          CLAUDE_WORKSPACE_DIR: workspace,
+          CHAT_ID: '164795011',
+        },
+        JSON.stringify({ tool_name: 'Bash', tool_input: { command: 'ls' } }),
+      )
+      expect(`${label}: ${r.code}`).toBe(`${label}: 2`)
+      const payload = JSON.parse(r.stdout)
+      expect(`${label}: ${payload.denied_by}`).toBe(`${label}: hook-failure`)
+      expect(`${label}: ${payload.reason.includes('chat 999')}`).toBe(`${label}: true`)
+    })
+  }
+
+  // …and an entry that simply has no deny block is NOT a mistake. No rules for
+  // a chat has always meant no denials, and a guard that cannot tell «absent»
+  // from «half-typed» would lock every chat with a persona and no rules.
+  test('another chat with no deny block at all is fine', () => {
     writeFileSync(
       policyPath,
-      'version: 1\nchats:\n  "164795011":\n    deny:\n      bash_patterns:\n        - "rm"\n  "999":\n    deny:\n      read_paths: "not-a-list"\n',
+      'version: 1\nchats:\n  "164795011":\n    deny:\n      bash_patterns:\n        - "rm"\n  "999":\n    persona_file: "persona.md"\n',
       'utf8',
     )
     const r = run(
@@ -807,10 +841,7 @@ describe('pre-tool-use.sh — a block says which kind of block it is', () => {
       },
       JSON.stringify({ tool_name: 'Bash', tool_input: { command: 'ls' } }),
     )
-    expect(r.code).toBe(2)
-    const payload = JSON.parse(r.stdout)
-    expect(payload.denied_by).toBe('hook-failure')
-    expect(payload.reason).toContain('chat 999')
+    expect(r.code).toBe(0)
   })
 
   // Every complaint at once. Naming only the first costs the operator one
