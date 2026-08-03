@@ -1,4 +1,8 @@
-node_modules/
+# No trailing slash: with one, this matched only a DIRECTORY, and a
+# `node_modules` SYMLINK (what a scratch worktree gets when you point it at the
+# main checkout's modules) slipped past into a commit. The pattern must cover
+# both forms.
+node_modules
 bun.lockb
 bun.lock
 *.log
