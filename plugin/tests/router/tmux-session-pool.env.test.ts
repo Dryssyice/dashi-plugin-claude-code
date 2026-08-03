@@ -476,7 +476,12 @@ describe('TmuxSessionPool end-to-end env sanitization', () => {
       stateDir: fixture.stateDir,
       workspaceDir: '/tmp/ws',
       chatsBasePath: '/tmp/ws/chats',
-      policyPath: '/tmp/ws/chats/policy.yaml',
+      // Deliberately NOT `{workspaceDir}/chats/policy.yaml` and not
+      // `{chatsBasePath}/policy.yaml`: with either, this assertion passes for a
+      // pool that derives the path from something else entirely instead of
+      // forwarding what it was given. Measured — with the matching default here
+      // a pool rewritten to use chatsBasePath left this test green.
+      policyPath: '/tmp/ws/SOMEWHERE-ELSE/policy.yaml',
       claudeBinary: 'claude',
       logger: nopLogger(),
     })
@@ -487,12 +492,12 @@ describe('TmuxSessionPool end-to-end env sanitization', () => {
     expect(argv).toContain('CHAT_ID=-100')
     expect(argv).toContain(`MULTICHAT_STATE_DIR=${fixture.stateDir}`)
     expect(argv).toContain('CLAUDE_WORKSPACE_DIR=/tmp/ws')
-    // The pool forwards the path it was GIVEN. It no longer has a default to
-    // fall back to — `policyPath` is required, so there is exactly one place
-    // the value is decided (server.ts) instead of two that have to keep
-    // agreeing. That the decided default matches the hooks' own fallback is
-    // pinned in server.boot.test.ts, against the hook scripts themselves.
-    expect(argv).toContain('TELEGRAM_MULTICHAT_POLICY_PATH=/tmp/ws/chats/policy.yaml')
+    // The pool forwards the path it was GIVEN, unmodified. It no longer has a
+    // default to fall back to — `policyPath` is required, so there is exactly
+    // one place the value is decided (server.ts) instead of two that have to
+    // keep agreeing. That the decided default matches the hooks' own fallback
+    // is pinned in server.boot.test.ts, against the hook scripts themselves.
+    expect(argv).toContain('TELEGRAM_MULTICHAT_POLICY_PATH=/tmp/ws/SOMEWHERE-ELSE/policy.yaml')
   })
 
   // The half of the policy-path fix that lives outside the hook. The hook reads
@@ -519,6 +524,25 @@ describe('TmuxSessionPool end-to-end env sanitization', () => {
     const argv = readFileSync(fixture.argvLog, 'utf8')
     expect(argv).toContain('TELEGRAM_MULTICHAT_POLICY_PATH=/etc/thrall/custom-policy.yaml')
     expect(argv).not.toContain('TELEGRAM_MULTICHAT_POLICY_PATH=/tmp/ws/chats/policy.yaml')
+  })
+
+  test('an empty policyPath is refused, not quietly treated as unset', () => {
+    if (fixture === undefined) throw new Error('fixture missing')
+    // The type says `string`, and '' is a string. Both hooks read
+    // `${VAR:-default}`, so an empty export is indistinguishable from a missing
+    // one — the silent fallback the required option was meant to close.
+    expect(
+      () =>
+        new TmuxSessionPool({
+          policy: makePolicy('-102'),
+          stateDir: fixture!.stateDir,
+          workspaceDir: '/tmp/ws',
+          chatsBasePath: '/tmp/ws/chats',
+          policyPath: '',
+          claudeBinary: 'claude',
+          logger: nopLogger(),
+        }),
+    ).toThrow(/policyPath must not be empty/)
   })
 
   test('non-allowlisted but non-forbidden key (HOSTNAME) is dropped', async () => {

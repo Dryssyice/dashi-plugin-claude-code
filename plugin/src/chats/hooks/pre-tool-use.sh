@@ -56,12 +56,17 @@ fi
 WORKSPACE="${CLAUDE_WORKSPACE_DIR:-${HOME}/.claude-lab/thrall/.claude}"
 # The server accepts a configured policy path (`config.multichat.policy_path` /
 # TELEGRAM_MULTICHAT_POLICY_PATH); the hook honours the same env var so the two
-# read the SAME file when it is set. The remaining half of that gap is named
-# rather than papered over: `tmux-session-pool.ts` exports only
-# CLAUDE_WORKSPACE_DIR into a chat session, so on a deployment using
-# `policy_path` from config the variable never reaches here and the hook falls
-# back to the default file — which is the fail-CLOSED direction (absent file =
-# deny), but it is a lockout, not a gate. Exporting it belongs with the pool.
+# read the SAME file when it is set. The pool DOES export it now
+# (`tmux-session-pool.ts` puts it in the tmux `-e` argv and
+# `scripts/spawn-chat-shell.sh` re-exports it across the `env -i` wipe), so the
+# fallback below is for sessions that arrive without it.
+#
+# Correcting what this comment used to claim: falling back to the default file
+# is NOT the fail-closed direction. Absent-file-means-deny is only the case
+# when the default is absent; when it exists and is weaker than the file the
+# server validated, the gate ALLOWS what the server would have refused. A
+# lockout is loud and gets fixed in minutes — a wrong allow is silent, and this
+# hook is the only gate a `bypassPermissions` session has.
 POLICY_PATH="${TELEGRAM_MULTICHAT_POLICY_PATH:-${WORKSPACE}/chats/policy.yaml}"
 
 if [[ ! -f "$POLICY_PATH" ]]; then

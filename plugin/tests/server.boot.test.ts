@@ -233,9 +233,19 @@ describe('FIX-G / M3 — loadPolicyFromPath honours EXACT file path', () => {
 // ─────────────────────────────────────────────────────────────────────
 
 describe('default policy path agrees with the hooks that fall back to it', () => {
-  // `${TELEGRAM_MULTICHAT_POLICY_PATH:-${WORKSPACE}/chats/policy.yaml}` →
-  // the tail after `${WORKSPACE}`.
-  const FALLBACK = /\$\{TELEGRAM_MULTICHAT_POLICY_PATH:-\$\{WORKSPACE\}([^}"]*)\}/
+  // Anchored to a LIVE assignment at column 0, not to the literal appearing
+  // anywhere in the file. Measured: the unanchored version passed against a
+  // hook that hardcoded the path and kept the old line as a `# was: ...`
+  // comment — an assertion satisfied by prose. `^...=` at line start with the
+  // `m` flag excludes comments and indented env-prefix uses.
+  //
+  // What this pair of tests proves and does NOT prove: it proves the two
+  // written-down copies of the DEFAULT agree. It cannot prove the hook honours
+  // the variable at runtime — a reassignment on the following line defeats any
+  // source regex. That is proved behaviourally, by running each hook against
+  // two policy files: hooks-sentinel.test.ts, «TELEGRAM_MULTICHAT_POLICY_PATH
+  // is the file the hook reads», once per hook.
+  const FALLBACK = /^POLICY_PATH="\$\{TELEGRAM_MULTICHAT_POLICY_PATH:-\$\{WORKSPACE\}([^}"]*)\}"/m
 
   for (const hook of ['pre-tool-use.sh', 'session-start.sh']) {
     test(`${hook} falls back to the path defaultMultichatPolicyPath builds`, () => {

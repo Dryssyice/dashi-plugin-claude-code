@@ -307,10 +307,20 @@ export class TmuxSessionPool {
     // hooks registration. Default mirrors the canonical Thrall layout
     // (`{workspace}/chats/.claude/settings.json`).
     this.chatsBasePath = opts.chatsBasePath ?? join(opts.workspaceDir, 'chats')
-    // Same default the hook falls back to, so the two agree when nothing is
-    // configured and agree explicitly when something is.
     // No default: the only correct value is the file the server loaded, and a
     // default here is a second place for it to be decided.
+    //
+    // Empty is rejected rather than accepted, because an empty string is the
+    // silent fallback re-entering through a door the type check does not
+    // cover: `policyPath: ''` compiles, emits `-e TELEGRAM_...=`, and both
+    // hooks use `${VAR:-default}`, which treats empty exactly like unset. The
+    // gate would then read the default file while the server read another one
+    // — the whole defect, restored, with no error anywhere.
+    if (opts.policyPath === '') {
+      throw new Error(
+        'TmuxSessionPool: policyPath must not be empty — pass the file the server loaded',
+      )
+    }
     this.policyPath = opts.policyPath
     this.claudeBinary = opts.claudeBinary ?? 'claude'
     this.entrypointScript = opts.entrypointScript

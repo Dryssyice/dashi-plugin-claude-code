@@ -1335,7 +1335,9 @@ describe('pre-tool-use.sh — a block says which kind of block it is', () => {
   })
 
   // A configured policy path must reach the hook, or the server and the gate
-  // read different files. The pool does not export it yet — named in the hook.
+  // read different files. The pool exports it now — this test covers the hook's
+  // half; the pool's half is tests/router/tmux-session-pool.env.test.ts, and
+  // the `env -i` wipe below it is covered there too.
   test('TELEGRAM_MULTICHAT_POLICY_PATH is the file the hook reads', () => {
     const elsewhere = join(workspace, 'elsewhere.yaml')
     writeFileSync(
@@ -2043,5 +2045,91 @@ describe('session-start.sh — degraded-mode warning (Opus #16)', () => {
     expect(ctx).toContain('Тралл')
     expect(ctx).not.toContain('degraded mode')
     expect(ctx).not.toContain('Persona file missing')
+  })
+})
+
+// The twin of `TELEGRAM_MULTICHAT_POLICY_PATH is the file the hook reads`
+// above, for the OTHER consumer of policy.yaml in the same session.
+//
+// Why behavioural and not a regex over the script: server.boot.test.ts pins
+// this hook's fallback by reading the literal out of the source, and a source
+// regex is satisfied by prose. Measured — the literal left behind in a
+// `# was: ...` comment, or the live line reassigned on the very next line,
+// both leave that check green while the hook ignores the variable completely.
+// Running the hook cannot be fooled that way: the reminder either comes out of
+// the named file or it does not.
+describe('session-start.sh — the reminder comes from the file the server loaded', () => {
+  test('TELEGRAM_MULTICHAT_POLICY_PATH is the file the hook reads', () => {
+    mkdirSync(join(workspace, 'chats', '164795011'), { recursive: true })
+    writeFileSync(
+      join(workspace, 'chats', '164795011', 'persona.md'),
+      'Тралл',
+      'utf8',
+    )
+    // Two policies, each naming itself in system_reminder. The DEFAULT one
+    // exists and is valid, so a hook that ignores the variable does not fail —
+    // it quietly serves the wrong reminder, which is the actual defect.
+    writeFileSync(
+      policyPath,
+      policyOf(
+        entry('164795011').replace(
+          '    system_reminder: ""',
+          "    system_reminder: 'FROM-THE-DEFAULT-FILE'",
+        ),
+      ),
+      'utf8',
+    )
+    const elsewhere = join(workspace, 'elsewhere.yaml')
+    writeFileSync(
+      elsewhere,
+      policyOf(
+        entry('164795011').replace(
+          '    system_reminder: ""',
+          "    system_reminder: 'FROM-THE-CONFIGURED-FILE'",
+        ),
+      ),
+      'utf8',
+    )
+
+    const r = run(SESSION_HOOK, {
+      MULTICHAT_STATE_DIR: workspace,
+      CLAUDE_WORKSPACE_DIR: workspace,
+      CHAT_ID: '164795011',
+      TELEGRAM_MULTICHAT_POLICY_PATH: elsewhere,
+    })
+
+    expect(r.code).toBe(0)
+    const ctx = JSON.parse(r.stdout).hookSpecificOutput?.additionalContext ?? ''
+    expect(ctx).toContain('FROM-THE-CONFIGURED-FILE')
+    // Naming the wrong file explicitly: without this the assertion above would
+    // still pass if the hook somehow concatenated both.
+    expect(ctx).not.toContain('FROM-THE-DEFAULT-FILE')
+  })
+
+  test('with the variable unset the default file is still read', () => {
+    // The fallback is not decoration — a session spawned before this chain
+    // existed, or a hand-rolled tmux session, arrives with no variable at all.
+    mkdirSync(join(workspace, 'chats', '164795011'), { recursive: true })
+    writeFileSync(join(workspace, 'chats', '164795011', 'persona.md'), 'Тралл', 'utf8')
+    writeFileSync(
+      policyPath,
+      policyOf(
+        entry('164795011').replace(
+          '    system_reminder: ""',
+          "    system_reminder: 'FROM-THE-DEFAULT-FILE'",
+        ),
+      ),
+      'utf8',
+    )
+
+    const r = run(SESSION_HOOK, {
+      MULTICHAT_STATE_DIR: workspace,
+      CLAUDE_WORKSPACE_DIR: workspace,
+      CHAT_ID: '164795011',
+    })
+
+    expect(r.code).toBe(0)
+    const ctx = JSON.parse(r.stdout).hookSpecificOutput?.additionalContext ?? ''
+    expect(ctx).toContain('FROM-THE-DEFAULT-FILE')
   })
 })
