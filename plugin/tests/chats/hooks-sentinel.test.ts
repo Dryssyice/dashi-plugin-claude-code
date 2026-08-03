@@ -18,7 +18,13 @@
 
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { spawnSync } from 'child_process'
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'fs'
+import { chmodSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'fs'
+// Static, exactly as policy-loader.ts imports it. A dynamic `await
+// import('js-yaml')` handed back a namespace whose JSON_SCHEMA was undefined,
+// so `load(..., {schema: undefined})` quietly fell back to js-yaml's DEFAULT
+// schema — where `007` is the integer 7. The parity assertions were then
+// comparing the hook against a reader the server does not use.
+import { JSON_SCHEMA, load as parseYaml } from 'js-yaml'
 import { tmpdir } from 'os'
 import { join } from 'path'
 
@@ -547,22 +553,33 @@ describe('pre-tool-use.sh — a block says which kind of block it is', () => {
   // raise AttributeError and exit 1 — and Claude blocks on exit 2 and ONLY on
   // exit 2, so the fail-safe hook was failing OPEN in the corner it exists for.
   // The old suite could not see it: it tested torn YAML, never wrong-shaped YAML.
-  const MISSHAPEN: ReadonlyArray<readonly [string, string]> = [
-    ['a top-level list', '- one\n- two\n'],
-    ['a top-level scalar', 'just a string\n'],
-    ['chats as a list', 'version: 1\nchats:\n  - "164795011"\n'],
-    ['the chat entry as a list', 'version: 1\nchats:\n  "164795011":\n    - deny\n'],
+  //
+  // Third column: the phrase the refusal must carry. Without it, deleting a
+  // shape guard keeps the suite green — the AttributeError one line later is
+  // caught by the crash trap, which returns the SAME exit 2 and the SAME
+  // denied_by, and only the reason says which of the two actually ran.
+  const MISSHAPEN: ReadonlyArray<readonly [string, string, string]> = [
+    ['a top-level list', '- one\n- two\n', 'root is not a mapping'],
+    ['a top-level scalar', 'just a string\n', 'root is not a mapping'],
+    ['chats as a list', 'version: 1\nchats:\n  - "164795011"\n', 'chats is not a mapping'],
+    [
+      'the chat entry as a list',
+      'version: 1\nchats:\n  "164795011":\n    - deny\n',
+      'entry is not a mapping',
+    ],
     [
       'the deny block as a list',
       'version: 1\nchats:\n  "164795011":\n    deny:\n      - rm -rf /\n',
+      'deny is not a mapping',
     ],
     [
       'a deny list given as a bare string',
       'version: 1\nchats:\n  "164795011":\n    deny:\n      bash_patterns: "ls"\n',
+      'bash_patterns is not a list',
     ],
   ]
 
-  for (const [label, yaml] of MISSHAPEN) {
+  for (const [label, yaml, phrase] of MISSHAPEN) {
     test(`valid YAML with ${label} denies, and says the hook failed`, () => {
       writeFileSync(policyPath, yaml, 'utf8')
       const r = run(
@@ -579,6 +596,7 @@ describe('pre-tool-use.sh — a block says which kind of block it is', () => {
       const payload = JSON.parse(r.stdout)
       expect(payload.decision).toBe('block')
       expect(payload.denied_by).toBe('hook-failure')
+      expect(`${label}: ${payload.reason.includes(phrase)}`).toBe(`${label}: true`)
     })
   }
 
@@ -792,9 +810,14 @@ describe('pre-tool-use.sh — a block says which kind of block it is', () => {
       'unknown deny keys',
     ],
     [
-      'non-string rules inside a valid list — [on, 007] is [True, 7] after YAML',
-      'version: 1\nchats:\n  "164795011":\n    deny:\n      bash_patterns:\n        - on\n        - 007\n',
-      'has non-string rules at #1, #2',
+      'a rule that is genuinely not a string — a nested list',
+      policyOf(
+        entry(
+          '164795011',
+          ['    deny:', '      bash_patterns:', '        - ["rm"]', '        - "ok"'].join('\n'),
+        ),
+      ),
+      'has non-string rules at #1',
     ],
     [
       'a version this hook does not know',
@@ -896,7 +919,14 @@ describe('pre-tool-use.sh — a block says which kind of block it is', () => {
   // rule from every live session, logged nowhere.
   const SILENTLY_EMPTY: ReadonlyArray<readonly [string, string, string]> = [
     ['an empty file', '{}\n', 'version is missing'],
-    ['a version with no chats block', 'version: 1\n', 'the chats block is missing'],
+    ['a version with no chats block', 'version: 1\n', 'missing top-level keys'],
+    // …and the same absence with everything else present, so the message has to
+    // name `chats` itself rather than ride on its neighbours being missing too.
+    [
+      'every top-level key except chats',
+      'version: 1\nallowlist:\n  chats: []\n  users: []\nmention_allowlist: []\n',
+      'missing top-level keys: chats',
+    ],
     [
       'a chats block with no chats in it',
       'version: 1\nchats: {}\n',
@@ -1110,34 +1140,50 @@ describe('pre-tool-use.sh — a block says which kind of block it is', () => {
   // the loader (js-yaml, JSON_SCHEMA) sees the string "off". A hook that
   // validated that value against the enum would deny every tool call in every
   // chat over a legal, documented file.
+  // `streaming: off` is the whole point and it is the ONE trap that is legal:
+  // the schema's enum contains the string "off", js-yaml under JSON_SCHEMA hands
+  // it over as that string, and PyYAML hands the hook the boolean False. So a
+  // hook comparing that value against the enum denies every call in every chat
+  // over a file the server loaded happily.
+  //
+  // An earlier version of this fixture also wrote `tmux_mirror: no` and
+  // `edit_message_progress: yes` and called them documented. They are not: those
+  // arrive at the LOADER as the strings "no"/"yes" and Zod rejects them as
+  // booleans. Claiming a loader-invalid file was the documented shape is the
+  // same substitution this file keeps finding — hence the schema assertion at
+  // the end, which would have caught it.
+  const DOCUMENTED_POLICY = [
+    'version: 1',
+    'allowlist:',
+    '  chats: ["164795011"]',
+    '  users: ["abramov_aicreator"]',
+    'mention_allowlist: ["abramov_aicreator"]',
+    'chats:',
+    '  "164795011":',
+    '    mode: private',
+    '    streaming: off',
+    '    tmux_mirror: false',
+    '    edit_message_progress: true',
+    '    delivery: final_only',
+    '    persona_file: persona.md',
+    '    handoff_file: handoff.md',
+    '    system_reminder: ""',
+    '    idle_ttl_ms: 1800000',
+    '    max_queue_depth: 1',
+    '    deny:',
+    '      bash_patterns:',
+    '        - "rm -rf /"',
+    '',
+  ].join('\n')
+
+  test('the documented policy the hook accepts is one the real loader accepts', async () => {
+    const { MultichatPolicySchema } = await import('../../src/chats/policy-loader')
+    const result = MultichatPolicySchema.safeParse(parseYaml(DOCUMENTED_POLICY, { schema: JSON_SCHEMA }))
+    expect(result.success ? 'accepted' : JSON.stringify(result.error.issues)).toBe('accepted')
+  })
+
   test('a chat entry with the full documented shape is accepted, values and all', () => {
-    writeFileSync(
-      policyPath,
-      [
-        'version: 1',
-        'allowlist:',
-        '  chats: ["164795011"]',
-        '  users: ["abramov_aicreator"]',
-        'mention_allowlist: ["abramov_aicreator"]',
-        'chats:',
-        '  "164795011":',
-        '    mode: private',
-        '    streaming: off',
-        '    tmux_mirror: no',
-        '    edit_message_progress: yes',
-        '    delivery: final_only',
-        '    persona_file: persona.md',
-        '    handoff_file: handoff.md',
-        '    system_reminder: ""',
-        '    idle_ttl_ms: 1800000',
-        '    max_queue_depth: 1',
-        '    deny:',
-        '      bash_patterns:',
-        '        - "rm -rf /"',
-        '',
-      ].join('\n'),
-      'utf8',
-    )
+    writeFileSync(policyPath, DOCUMENTED_POLICY, 'utf8')
     const env = {
       MULTICHAT_STATE_DIR: workspace,
       CLAUDE_WORKSPACE_DIR: workspace,
@@ -1173,8 +1219,7 @@ describe('pre-tool-use.sh — a block says which kind of block it is', () => {
   // round has to notice by eye.
   test('the fixture builder produces a policy the real loader accepts', async () => {
     const { MultichatPolicySchema } = await import('../../src/chats/policy-loader')
-    const { JSON_SCHEMA, load } = await import('js-yaml')
-    const parsed = load(
+    const parsed = parseYaml(
       policyOf(
         entry('164795011', ['    deny:', '      bash_patterns:', '        - "rm"'].join('\n')),
         entry('999'),
@@ -1218,8 +1263,19 @@ describe('pre-tool-use.sh — a block says which kind of block it is', () => {
     // The top level, pinned the same way. It has no optional fields, so one
     // list is both «required» and «all allowed» — and if the schema ever grows
     // an optional one, this equality is what notices.
-    const { MultichatPolicySchema } = await import('../../src/chats/policy-loader')
+    const { MultichatPolicySchema, DenyRulesSchema } = await import('../../src/chats/policy-loader')
     expect(namesIn('TOP_REQUIRED')).toEqual(Object.keys(MultichatPolicySchema.shape).sort())
+
+    // …and the deny keys, which were pinned to nothing at all. Add a fourth
+    // deny list to `DenyRulesSchema` and the loader would accept files this
+    // hook refuses with «unknown deny keys» — every chat using the new list
+    // locked, live. That is exactly what the other pins exist to prevent, one
+    // level further down.
+    expect(namesIn('DENY_KEYS')).toEqual(Object.keys(DenyRulesSchema.shape).sort())
+
+    // The allowlist block, for the same reason and at the same cost.
+    const allowlistShape = MultichatPolicySchema.shape.allowlist.shape as Record<string, unknown>
+    expect(namesIn('ALLOWLIST_KEYS')).toEqual(Object.keys(allowlistShape).sort())
   })
 
   // The top-level half of the invariant, missing until codex asked for it a
@@ -1243,6 +1299,506 @@ describe('pre-tool-use.sh — a block says which kind of block it is', () => {
       'unknown top-level keys: bypass',
     ],
   ]
+
+  // The loader refuses a world-writable policy.yaml before it parses a byte.
+  // The hook is the one that re-reads the file on every call, so it is the one
+  // that would go on applying a policy anyone on the machine can rewrite.
+  test('a world-writable policy.yaml is refused', () => {
+    writeFileSync(policyPath, policyOf(entry('164795011')), 'utf8')
+    chmodSync(policyPath, 0o666)
+    const r = run(
+      PRE_HOOK,
+      {
+        MULTICHAT_STATE_DIR: workspace,
+        CLAUDE_WORKSPACE_DIR: workspace,
+        CHAT_ID: '164795011',
+      },
+      JSON.stringify({ tool_name: 'Bash', tool_input: { command: 'ls' } }),
+    )
+    expect(r.code).toBe(2)
+    const payload = JSON.parse(r.stdout)
+    expect(payload.denied_by).toBe('hook-failure')
+    expect(payload.reason).toContain('world-writable')
+
+    // …and the same file, one permission bit later, is fine again.
+    chmodSync(policyPath, 0o644)
+    const after = run(
+      PRE_HOOK,
+      {
+        MULTICHAT_STATE_DIR: workspace,
+        CLAUDE_WORKSPACE_DIR: workspace,
+        CHAT_ID: '164795011',
+      },
+      JSON.stringify({ tool_name: 'Bash', tool_input: { command: 'ls' } }),
+    )
+    expect(`after chmod: ${after.code}`).toBe('after chmod: 0')
+  })
+
+  // A configured policy path must reach the hook, or the server and the gate
+  // read different files. The pool does not export it yet — named in the hook.
+  test('TELEGRAM_MULTICHAT_POLICY_PATH is the file the hook reads', () => {
+    const elsewhere = join(workspace, 'elsewhere.yaml')
+    writeFileSync(
+      elsewhere,
+      policyOf(
+        entry('164795011', ['    deny:', '      bash_patterns:', '        - "only-here"'].join('\n')),
+      ),
+      'utf8',
+    )
+    // The default file exists and denies nothing, so a hook reading the wrong
+    // one would allow the call and the test would say so.
+    writeFileSync(policyPath, policyOf(entry('164795011')), 'utf8')
+    const r = run(
+      PRE_HOOK,
+      {
+        MULTICHAT_STATE_DIR: workspace,
+        CLAUDE_WORKSPACE_DIR: workspace,
+        CHAT_ID: '164795011',
+        TELEGRAM_MULTICHAT_POLICY_PATH: elsewhere,
+      },
+      JSON.stringify({ tool_name: 'Bash', tool_input: { command: 'run only-here now' } }),
+    )
+    expect(r.code).toBe(2)
+    expect(JSON.parse(r.stdout).denied_by).toBe('policy')
+  })
+
+  // codex round 11. Key-name parity was parity in appearance: `allowlist: {}`
+  // carries the right NAME and is a file the loader throws on, and these two
+  // lists decide who may reach the bot at all.
+  const NESTED_BROKEN: ReadonlyArray<readonly [string, string, string]> = [
+    ['allowlist is empty', 'allowlist: {}\n', 'allowlist.chats is missing'],
+    ['allowlist is a list', 'allowlist: []\n', 'allowlist is not a mapping'],
+    [
+      'allowlist.users is a bare string',
+      'allowlist:\n  chats: []\n  users: "abramov_aicreator"\n',
+      'allowlist.users is not a list of non-empty strings',
+    ],
+    [
+      'a chat id in the allowlist left unquoted',
+      'allowlist:\n  chats: [164795011]\n  users: []\n',
+      'allowlist.chats is not a list of non-empty strings',
+    ],
+    [
+      'a key inside allowlist the schema never had',
+      'allowlist:\n  chats: []\n  users: []\n  admins: []\n',
+      'unknown allowlist keys: admins',
+    ],
+  ]
+
+  for (const [label, allowlistYaml, phrase] of NESTED_BROKEN) {
+    test(`a top-level block of the wrong shape is refused: ${label}`, () => {
+      writeFileSync(
+        policyPath,
+        `version: 1\n${allowlistYaml}mention_allowlist: []\nchats:\n  "164795011": {}\n`,
+        'utf8',
+      )
+      const r = run(
+        PRE_HOOK,
+        {
+          MULTICHAT_STATE_DIR: workspace,
+          CLAUDE_WORKSPACE_DIR: workspace,
+          CHAT_ID: '164795011',
+        },
+        JSON.stringify({ tool_name: 'Bash', tool_input: { command: 'ls' } }),
+      )
+      expect(`${label}: ${r.code}`).toBe(`${label}: 2`)
+      const payload = JSON.parse(r.stdout)
+      expect(`${label}: ${payload.denied_by}`).toBe(`${label}: hook-failure`)
+      expect(`${label}: ${payload.reason.includes(phrase)}`).toBe(`${label}: true`)
+    })
+  }
+
+  // Values, for the fields that do not meet a YAML 1.1 boolean on the way in.
+  const BAD_VALUES: ReadonlyArray<readonly [string, string, string]> = [
+    ['a mode the schema has no name for', '    mode: admin\n', 'mode is not one of private, public'],
+    [
+      'a delivery the schema has no name for',
+      '    delivery: instant\n',
+      'delivery is not one of streamed, final_only',
+    ],
+    ['an empty persona_file', '    persona_file: ""\n', 'persona_file is not a non-empty string'],
+    ['a handoff_file that is a number', '    handoff_file: 42\n', 'handoff_file is not a non-empty'],
+    ['a zero ttl', '    idle_ttl_ms: 0\n', 'idle_ttl_ms is not a positive whole number'],
+    [
+      'a queue depth given as a boolean',
+      '    max_queue_depth: true\n',
+      'max_queue_depth is not a positive whole number',
+    ],
+  ]
+
+  for (const [label, override, phrase] of BAD_VALUES) {
+    test(`a chat entry value the loader rejects is refused: ${label}`, () => {
+      // Drop the field if the builder wrote one (the required half) and put the
+      // bad value in its place; the two optional fields are simply added.
+      const field = override.trim().split(':')[0]
+      writeFileSync(
+        policyPath,
+        policyOf(entry('164795011')).replace(new RegExp(`    ${field}:.*\\n`), '') + override,
+        'utf8',
+      )
+      const r = run(
+        PRE_HOOK,
+        {
+          MULTICHAT_STATE_DIR: workspace,
+          CLAUDE_WORKSPACE_DIR: workspace,
+          CHAT_ID: '164795011',
+        },
+        JSON.stringify({ tool_name: 'Bash', tool_input: { command: 'ls' } }),
+      )
+      expect(`${label}: ${r.code}`).toBe(`${label}: 2`)
+      const payload = JSON.parse(r.stdout)
+      expect(`${label}: ${payload.denied_by}`).toBe(`${label}: hook-failure`)
+      expect(`${label}: ${payload.reason.includes(phrase)}`).toBe(`${label}: true`)
+    })
+  }
+
+  // …and the three that must NOT be judged, which is the same list from the
+  // other side. Written as its own test because a later round tempted to
+  // "finish the parity" will turn this red instead of turning the chats off.
+  // The pair that proves the hook and the loader now read the same types, in
+  // both directions. This used to be one test asserting that all three YAML 1.1
+  // spellings pass unexamined — which was the workaround, not the answer.
+  const rule = (spelling: string): string =>
+    policyOf(
+      entry('164795011', ['    deny:', '      bash_patterns:', `        - ${spelling}`].join('\n')),
+    )
+  const field = (line: string, spelling: string): string =>
+    policyOf(entry('164795011')).replace(line, spelling)
+
+  const COERCION_PAIRS: ReadonlyArray<readonly [string, string, number]> = [
+    // `off` IS in the schema's enum, so it is a legal value and stays legal.
+    ['streaming: off', field('    streaming: progress\n', '    streaming: off\n'), 0],
+    // `no` and `yes` are NOT booleans in JSON types — the loader rejects them,
+    // and so does the hook now, instead of accepting a file the server refuses.
+    ['tmux_mirror: no', field('    tmux_mirror: false\n', '    tmux_mirror: no\n'), 2],
+    [
+      'edit_message_progress: yes',
+      field('    edit_message_progress: false\n', '    edit_message_progress: yes\n'),
+      2,
+    ],
+    // `on` is a STRING to js-yaml and was a boolean to PyYAML — this was the
+    // lockout: the server loads a live rule, the hook called it a non-string
+    // and denied every call in every chat until the file was edited.
+    ['a rule spelled on', rule('on'), 0],
+    // `007`, measured against the js-yaml the server actually imports, is the
+    // NUMBER 7 — its JSON_SCHEMA is not strict JSON. So both readers refuse it,
+    // and the point is that they agree, not which way they went.
+    ['a rule spelled 007', rule('007'), 2],
+    // …and neither reader turns a clock-shaped string into 750.
+    ['a rule spelled 12:30', rule('"12:30"'), 0],
+    // …while a rule that is genuinely not a string stays a refusal in both.
+    ['a rule that is a list', rule('["rm"]'), 2],
+  ]
+
+  for (const [label, yaml, expected] of COERCION_PAIRS) {
+    test(`the hook reads YAML the way the loader does: ${label}`, async () => {
+      writeFileSync(policyPath, yaml, 'utf8')
+
+      // Whatever the hook decides, the LOADER's verdict on the same bytes is
+      // the thing being matched — asserted here rather than assumed.
+      const { MultichatPolicySchema } = await import('../../src/chats/policy-loader')
+        const verdict = MultichatPolicySchema.safeParse(parseYaml(yaml, { schema: JSON_SCHEMA }))
+      expect(`${label}: loader accepts = ${verdict.success}`).toBe(
+        `${label}: loader accepts = ${expected === 0}`,
+      )
+
+      const r = run(
+        PRE_HOOK,
+        {
+          MULTICHAT_STATE_DIR: workspace,
+          CLAUDE_WORKSPACE_DIR: workspace,
+          CHAT_ID: '164795011',
+        },
+        JSON.stringify({ tool_name: 'Bash', tool_input: { command: 'ls' } }),
+      )
+      expect(`${label}: hook exit ${r.code}`).toBe(`${label}: hook exit ${expected}`)
+    })
+  }
+
+  // The rule that was lost to coercion must actually FIRE, not merely be
+  // accepted: `007` is a live deny rule on the server, so it has to bite here.
+  test('a rule the old reader turned into a boolean still denies', () => {
+    writeFileSync(
+      policyPath,
+      policyOf(
+        entry('164795011', ['    deny:', '      bash_patterns:', '        - on'].join('\n')),
+      ),
+      'utf8',
+    )
+    const r = run(
+      PRE_HOOK,
+      {
+        MULTICHAT_STATE_DIR: workspace,
+        CLAUDE_WORKSPACE_DIR: workspace,
+        CHAT_ID: '164795011',
+      },
+      JSON.stringify({ tool_name: 'Bash', tool_input: { command: 'systemctl start on-demand' } }),
+    )
+    expect(r.code).toBe(2)
+    // …by the POLICY, not by a shape complaint: the rule is live, which is the
+    // whole difference between this and the lockout it replaces.
+    expect(JSON.parse(r.stdout).denied_by).toBe('policy')
+  })
+
+  // A policy naming one chat twice: PyYAML kept the LAST entry, so `deny: {}`
+  // second wiped the rules and the hook allowed everything, while the server
+  // threw on the same file. js-yaml's behaviour is the correct one.
+  test('a policy naming the same chat twice is refused', () => {
+    writeFileSync(
+      policyPath,
+      policyOf(
+        entry(
+          '164795011',
+          ['    deny:', '      bash_patterns:', '        - "curl"'].join('\n'),
+        ),
+        entry('164795011', '    deny: {}'),
+      ),
+      'utf8',
+    )
+    const r = run(
+      PRE_HOOK,
+      {
+        MULTICHAT_STATE_DIR: workspace,
+        CLAUDE_WORKSPACE_DIR: workspace,
+        CHAT_ID: '164795011',
+      },
+      JSON.stringify({ tool_name: 'Bash', tool_input: { command: 'curl http://x' } }),
+    )
+    expect(r.code).toBe(2)
+    expect(JSON.parse(r.stdout).denied_by).toBe('hook-failure')
+  })
+
+  // An unknown key is text nobody meant to write. A mis-indented private note
+  // becomes a mapping KEY, and the refusal used to publish it into a session
+  // that may be sitting in a public group.
+  test('an unknown key of unusual shape is reported by position, not by text', () => {
+    writeFileSync(
+      policyPath,
+      policyOf(entry('164795011', '    /Users/andrei/private/board-notes-2026.md: 1')),
+      'utf8',
+    )
+    const r = run(
+      PRE_HOOK,
+      {
+        MULTICHAT_STATE_DIR: workspace,
+        CLAUDE_WORKSPACE_DIR: workspace,
+        CHAT_ID: '164795011',
+      },
+      JSON.stringify({ tool_name: 'Bash', tool_input: { command: 'ls' } }),
+    )
+    expect(r.code).toBe(2)
+    expect(r.stdout).not.toContain('board-notes')
+    expect(r.stderr).not.toContain('board-notes')
+    expect(JSON.parse(r.stdout).reason).toContain('entry key #1')
+  })
+
+  // …and an ordinary typo is still named, because that is the whole diagnostic
+  // value of the message.
+  test('an unknown key of ordinary shape is still named', () => {
+    writeFileSync(policyPath, policyOf(entry('164795011', '    deney: {}')), 'utf8')
+    const r = run(
+      PRE_HOOK,
+      {
+        MULTICHAT_STATE_DIR: workspace,
+        CLAUDE_WORKSPACE_DIR: workspace,
+        CHAT_ID: '164795011',
+      },
+      JSON.stringify({ tool_name: 'Bash', tool_input: { command: 'ls' } }),
+    )
+    expect(r.code).toBe(2)
+    expect(JSON.parse(r.stdout).reason).toContain('unknown keys: deney')
+  })
+
+  // A glob rule must actually glob. Deleting the meta-character test left the
+  // whole suite green because no fixture anywhere used a `*` bash pattern —
+  // every glob rule silently degraded to a literal substring test.
+  test('a bash_patterns rule with a wildcard matches as a glob', () => {
+    writeFileSync(
+      policyPath,
+      policyOf(
+        entry(
+          '164795011',
+          ['    deny:', '      bash_patterns:', '        - "*curl*token*"'].join('\n'),
+        ),
+      ),
+      'utf8',
+    )
+    const env = {
+      MULTICHAT_STATE_DIR: workspace,
+      CLAUDE_WORKSPACE_DIR: workspace,
+      CHAT_ID: '164795011',
+    }
+    const hit = run(
+      PRE_HOOK,
+      env,
+      JSON.stringify({ tool_name: 'Bash', tool_input: { command: 'curl -H token http://x' } }),
+    )
+    expect(`glob hit: ${hit.code}`).toBe('glob hit: 2')
+    expect(JSON.parse(hit.stdout).denied_by).toBe('policy')
+
+    // …and the same rule read as a literal substring would match nothing here,
+    // which is what makes the case above a real test of the glob branch.
+    const miss = run(
+      PRE_HOOK,
+      env,
+      JSON.stringify({ tool_name: 'Bash', tool_input: { command: 'curl http://x' } }),
+    )
+    expect(`glob miss: ${miss.code}`).toBe('glob miss: 0')
+  })
+
+  // Case-insensitivity is documented at the top of the hook and no fixture ever
+  // used mixed case, so dropping both `.lower()` calls kept the suite green.
+  test('bash_patterns matching ignores case, as documented', () => {
+    writeFileSync(
+      policyPath,
+      policyOf(
+        entry('164795011', ['    deny:', '      bash_patterns:', '        - "sudo"'].join('\n')),
+      ),
+      'utf8',
+    )
+    const r = run(
+      PRE_HOOK,
+      {
+        MULTICHAT_STATE_DIR: workspace,
+        CLAUDE_WORKSPACE_DIR: workspace,
+        CHAT_ID: '164795011',
+      },
+      JSON.stringify({ tool_name: 'Bash', tool_input: { command: 'SUDO id' } }),
+    )
+    expect(r.code).toBe(2)
+    expect(JSON.parse(r.stdout).denied_by).toBe('policy')
+  })
+
+  // The last-resort guard, which had no test at all: an exception anywhere in
+  // the python must leave with 2. Without the excepthook the interpreter exits
+  // 1 — and 1 means ALLOW — while printing a traceback of policy internals.
+  //
+  // Provoked through the documented interface only: a pinned interpreter whose
+  // PYTHONPATH offers a `yaml` module returning a mapping that explodes when
+  // iterated. No production knob is involved.
+  test('an exception inside the hook denies rather than exiting 1', () => {
+    const fakeLib = join(workspace, 'fakelib')
+    mkdirSync(fakeLib, { recursive: true })
+    writeFileSync(
+      join(fakeLib, 'yaml.py'),
+      [
+        'class SafeLoader:',
+        '    yaml_implicit_resolvers = {}',
+        '    @classmethod',
+        '    def add_implicit_resolver(cls, *a, **k):',
+        '        pass',
+        '    @classmethod',
+        '    def add_constructor(cls, *a, **k):',
+        '        pass',
+        'class constructor:',
+        '    class ConstructorError(Exception):',
+        '        pass',
+        'class Boom(dict):',
+        '    def items(self):',
+        '        raise RuntimeError("boom")',
+        'def load(stream, Loader=None):',
+        '    return {"version": 1, "allowlist": {"chats": [], "users": []},',
+        '            "mention_allowlist": [], "chats": Boom()}',
+        '',
+      ].join('\n'),
+      'utf8',
+    )
+    const shim = join(workspace, 'python-with-fake-yaml.sh')
+    writeFileSync(
+      shim,
+      ['#!/usr/bin/env bash', `export PYTHONPATH="${fakeLib}"`, 'exec /usr/bin/python3 "$@"', ''].join(
+        '\n',
+      ),
+      'utf8',
+    )
+    chmodSync(shim, 0o755)
+
+    writeFileSync(policyPath, policyOf(entry('164795011')), 'utf8')
+    const r = run(
+      PRE_HOOK,
+      {
+        MULTICHAT_STATE_DIR: workspace,
+        CLAUDE_WORKSPACE_DIR: workspace,
+        CHAT_ID: '164795011',
+        CHATS_HOOK_PYTHON: shim,
+      },
+      JSON.stringify({ tool_name: 'Bash', tool_input: { command: 'ls' } }),
+    )
+    expect(`crash exit: ${r.code}`).toBe('crash exit: 2')
+    const payload = JSON.parse(r.stdout)
+    expect(payload.denied_by).toBe('hook-failure')
+    expect(payload.reason).toContain('hook crashed (RuntimeError)')
+    // The exception's own text can quote the policy or the tool call back.
+    expect(r.stdout).not.toContain('boom')
+  })
+
+  // `version: yes` was a boolean under YAML 1.1, and `True == 1` in Python, so
+  // the one value check in the hook passed a file the loader rejects.
+  // `version: yes` is a string now that the loader agrees with js-yaml, so it
+  // is caught by the plain `!= 1`. `version: true` is the case that still needs
+  // the isinstance guard: in Python `True == 1`, so without it a boolean
+  // version passes a check whose entire job is to pin the number 1.
+  for (const spelling of ['yes', 'true', 'True']) {
+    test(`a version spelled ${spelling} is refused`, () => {
+      writeFileSync(
+        policyPath,
+        policyOf(entry('164795011')).replace('version: 1', `version: ${spelling}`),
+        'utf8',
+      )
+      const r = run(
+        PRE_HOOK,
+        {
+          MULTICHAT_STATE_DIR: workspace,
+          CLAUDE_WORKSPACE_DIR: workspace,
+          CHAT_ID: '164795011',
+        },
+        JSON.stringify({ tool_name: 'Bash', tool_input: { command: 'ls' } }),
+      )
+      expect(`${spelling}: ${r.code}`).toBe(`${spelling}: 2`)
+      expect(`${spelling}: ${JSON.parse(r.stdout).reason.includes('version is not 1')}`).toBe(
+        `${spelling}: true`,
+      )
+    })
+  }
+
+  // JavaScript has one number type, so `1e3` and `1800000.0` are whole numbers
+  // to the loader. Demanding a Python `int` would refuse a file it accepts —
+  // the lockout direction again, and nothing in the suite had noticed.
+  for (const spelling of ['1e3', '1800000.0', '1800000']) {
+    test(`a ttl spelled ${spelling} is a whole number here too`, () => {
+      writeFileSync(
+        policyPath,
+        policyOf(entry('164795011')) + `    idle_ttl_ms: ${spelling}\n`,
+        'utf8',
+      )
+      const r = run(
+        PRE_HOOK,
+        {
+          MULTICHAT_STATE_DIR: workspace,
+          CLAUDE_WORKSPACE_DIR: workspace,
+          CHAT_ID: '164795011',
+        },
+        JSON.stringify({ tool_name: 'Bash', tool_input: { command: 'ls' } }),
+      )
+      expect(`${spelling}: ${r.code}`).toBe(`${spelling}: 0`)
+    })
+  }
+
+  // …and a fractional one is still refused, in both readers.
+  test('a fractional ttl is refused', () => {
+    writeFileSync(policyPath, policyOf(entry('164795011')) + '    idle_ttl_ms: 1.5\n', 'utf8')
+    const r = run(
+      PRE_HOOK,
+      {
+        MULTICHAT_STATE_DIR: workspace,
+        CLAUDE_WORKSPACE_DIR: workspace,
+        CHAT_ID: '164795011',
+      },
+      JSON.stringify({ tool_name: 'Bash', tool_input: { command: 'ls' } }),
+    )
+    expect(r.code).toBe(2)
+    expect(JSON.parse(r.stdout).reason).toContain('idle_ttl_ms is not a positive whole number')
+  })
 
   for (const [label, yaml, phrase] of TOP_LEVEL_BROKEN) {
     test(`a policy the loader would reject at the top level is refused: ${label}`, () => {

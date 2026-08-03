@@ -54,10 +54,27 @@ if [[ -z "${CHAT_ID:-}" ]]; then
 fi
 
 WORKSPACE="${CLAUDE_WORKSPACE_DIR:-${HOME}/.claude-lab/thrall/.claude}"
-POLICY_PATH="${WORKSPACE}/chats/policy.yaml"
+# The server accepts a configured policy path (`config.multichat.policy_path` /
+# TELEGRAM_MULTICHAT_POLICY_PATH); the hook honours the same env var so the two
+# read the SAME file when it is set. The remaining half of that gap is named
+# rather than papered over: `tmux-session-pool.ts` exports only
+# CLAUDE_WORKSPACE_DIR into a chat session, so on a deployment using
+# `policy_path` from config the variable never reaches here and the hook falls
+# back to the default file — which is the fail-CLOSED direction (absent file =
+# deny), but it is a lockout, not a gate. Exporting it belongs with the pool.
+POLICY_PATH="${TELEGRAM_MULTICHAT_POLICY_PATH:-${WORKSPACE}/chats/policy.yaml}"
 
 if [[ ! -f "$POLICY_PATH" ]]; then
   deny hook-failure 'policy.yaml not found (fail-safe deny)'
+fi
+
+# The loader refuses a world-writable policy.yaml before it parses a byte, and
+# for the better reason: a policy anyone can rewrite is not a policy. The hook
+# re-reads this file on EVERY tool call, so it is the one that would keep
+# applying an edited file for as long as the session lives.
+POLICY_MODE="$(stat -f '%OLp' "$POLICY_PATH" 2>/dev/null || stat -c '%a' "$POLICY_PATH" 2>/dev/null || true)"
+if [[ "$POLICY_MODE" =~ [2367]$ ]]; then
+  deny hook-failure 'policy.yaml is world-writable (fail-safe deny); chmod o-w it'
 fi
 
 # Pick an interpreter that can actually read the policy.
@@ -129,6 +146,7 @@ TMP_INPUT_PATH="$TMP_INPUT" \
 import fnmatch
 import json
 import os
+import re
 import sys
 
 
@@ -202,9 +220,122 @@ except ImportError:
     # died here on every call, and a guard that has fired once is worth keeping.
     emit_block('PyYAML missing in the chosen interpreter (fail-safe deny)', 'hook-failure')
 
+class JsonishLoader(yaml.SafeLoader):
+    """Read policy.yaml the way the server reads it, not the way YAML 1.1 says.
+
+    This is the root of a whole class of divergence, and it had been treated as
+    a fact of life for four rounds instead of as a bug. PyYAML implements YAML
+    1.1: `off`, `no`, `yes`, `on` are BOOLEANS and `007` is the integer 7.
+    js-yaml under `JSON_SCHEMA` -- which is what `policy-loader.ts` passes --
+    implements JSON types: all four of those are strings.
+
+    Two readers of one file disagreeing about types is not a caveat to document,
+    it is the bug. It cost both directions:
+
+      * fail-OPEN: the hook could not compare any value it might meet as a
+        coerced boolean, so `mode: admin` and `handoff_file: ""` were applied
+        here and rejected there;
+      * fail-CLOSED, and this one is worse: `bash_patterns: [on, 007]` is a
+        LEGAL policy the server loads with two live rules, and the hook read
+        `[True, 7]`, called them non-string rules and denied every tool call in
+        every chat -- including the reply that would have said why. The suite
+        even asserted that lockout as correct behaviour.
+
+    With the resolvers replaced, the hook sees exactly what the loader sees, and
+    the values can simply be checked.
+    """
+
+    pass
+
+
+# Built by SUBTRACTION from PyYAML's own table, not by writing JSON out from the
+# spec. The first attempt did the latter and was wrong within the hour: js-yaml
+# 4.3 under JSON_SCHEMA is not strict JSON either -- it reads `007` as 7, `~` as
+# null and `0x1A` as 26. Parity is defined by the library the server imports,
+# and it was measured against `plugin/node_modules/js-yaml` rather than assumed.
+#
+# Two resolvers differ and both are removed:
+#
+#   bool       PyYAML (YAML 1.1) also accepts `yes`/`no`/`on`/`off`. This is the
+#              divergence that cost the round: `streaming: off` and a rule
+#              spelled `on` mean opposite things to the two readers.
+#   timestamp  PyYAML turns `2026-08-03` into a date object; js-yaml leaves the
+#              string. A dated filename in `persona_file` was a type error here
+#              and an ordinary string there.
+#   int/float  PyYAML reads `12:30` as the sexagesimal integer 750 and `1_000`
+#              as 1000, while js-yaml leaves both as strings; and it reads `1e3`
+#              as a string where js-yaml gives 1000. Each one is a LOCKOUT
+#              rather than a hole -- a legal file the server loads and the gate
+#              refuses -- which is the failure direction that takes every chat
+#              down at once.
+#
+# Verified by diffing this class against `plugin/node_modules/js-yaml` over 35
+# scalars, not by reading either library's documentation.
+#
+# What is NOT claimed: agreement on every scalar ever written. `017` is 15 here
+# (PyYAML's constructor reads a leading zero as octal) and 17 there. Both are
+# integers, both are reachable only through `idle_ttl_ms` / `max_queue_depth`,
+# and naming the gap beats implying a parity that does not exist.
+_DROPPED_TAGS = (
+    'tag:yaml.org,2002:bool',
+    'tag:yaml.org,2002:timestamp',
+    'tag:yaml.org,2002:int',
+    'tag:yaml.org,2002:float',
+)
+
+JsonishLoader.yaml_implicit_resolvers = {
+    first: [(tag, regex) for tag, regex in resolvers if tag not in _DROPPED_TAGS]
+    for first, resolvers in yaml.SafeLoader.yaml_implicit_resolvers.items()
+}
+JsonishLoader.add_implicit_resolver(
+    'tag:yaml.org,2002:bool', re.compile(r'^(?:true|True|TRUE|false|False|FALSE)$'), 'tTfF'
+)
+JsonishLoader.add_implicit_resolver(
+    'tag:yaml.org,2002:int',
+    re.compile(r'^[-+]?(?:0b[01]+|0x[0-9a-fA-F]+|0o[0-7]+|[0-9]+)$'),
+    '-+0123456789',
+)
+JsonishLoader.add_implicit_resolver(
+    'tag:yaml.org,2002:float',
+    re.compile(
+        r'^(?:\.[0-9]+'
+        r'|[-+]?[0-9]+\.[0-9]*(?:[eE][-+]?[0-9]+)?'
+        r'|[-+]?[0-9]+[eE][-+]?[0-9]+'
+        r'|[-+]?\.(?:inf|Inf|INF)'
+        r'|\.(?:nan|NaN|NAN))$'
+    ),
+    '-+.0123456789',
+)
+
+
+def _no_duplicate_keys(loader, node, deep=False):
+    """Refuse a mapping that names the same key twice.
+
+    PyYAML keeps the LAST value; js-yaml throws. So a policy naming one chat
+    twice -- the second time with `deny: {}` -- left the server refusing to load
+    (documented as degrading multichat OFF, which does not stop the tmux
+    sessions already running) while this hook read a valid file with no rules in
+    it and allowed everything. A fail-open with no complaint anywhere.
+    """
+    mapping = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        if key in mapping:
+            raise yaml.constructor.ConstructorError(
+                'while constructing a mapping',
+                node.start_mark,
+                'found a duplicate key',
+                key_node.start_mark,
+            )
+        mapping[key] = loader.construct_object(value_node, deep=deep)
+    return mapping
+
+
+JsonishLoader.add_constructor('tag:yaml.org,2002:map', _no_duplicate_keys)
+
 try:
     with open(policy_path, 'r', encoding='utf-8') as f:
-        policy = yaml.safe_load(f)
+        policy = yaml.load(f, Loader=JsonishLoader)
 except Exception:  # noqa: BLE001
     # The parser's message quotes the offending LINE of policy.yaml. That line
     # is policy content and has no business in the caller's transcript, so the
@@ -236,6 +367,61 @@ CHAT_KEYS = CHAT_REQUIRED + CHAT_OPTIONAL
 # The top level of `MultichatPolicySchema`, which is `.strict()` with no
 # optional fields — so one list serves as both «required» and «all allowed».
 TOP_REQUIRED = ('version', 'allowlist', 'mention_allowlist', 'chats')
+# …and `allowlist` is itself `.strict()` with two required arrays of non-empty
+# strings. Checking the outer name and not the inside was parity in appearance
+# only: `allowlist: {}` is a file the loader throws on.
+ALLOWLIST_KEYS = ('chats', 'users')
+
+# ChatPolicySchema's value rules, all of them. Three of these used to be
+# excluded as «coercing» — `streaming` because its enum contains `off`, and the
+# two booleans because YAML 1.1 spells them `no`/`yes`. JsonishLoader above
+# removed the reason: the hook now reads the same types the loader reads, so
+# there is nothing left that cannot be compared.
+ENUM_FIELDS = {
+    'mode': ('private', 'public'),
+    'delivery': ('streamed', 'final_only'),
+    'streaming': ('progress', 'off'),
+}
+BOOL_FIELDS = ('tmux_mirror', 'edit_message_progress')
+NONEMPTY_FIELDS = ('persona_file', 'handoff_file')
+STRING_FIELDS = ('system_reminder',)
+POSITIVE_INT_FIELDS = ('idle_ttl_ms', 'max_queue_depth')
+
+
+def _is_string_list(value: object) -> bool:
+    """A list of non-empty strings, as `z.array(z.string().min(1))` means it.
+
+    Written out because a YAML list of ids is exactly where an unquoted number
+    hides: `chats: [164795011]` is a list of INTS here and would pass any check
+    that only asked «is it a list».
+    """
+    return isinstance(value, list) and all(
+        isinstance(item, str) and item for item in value
+    )
+
+
+KEY_SHAPE = re.compile(r'^[A-Za-z0-9_.-]{1,40}$')
+
+
+def safe_names(names: list, where: str) -> list:
+    """Echo key names back only when they look like key names.
+
+    An unknown key is by definition text nobody meant to write, of arbitrary
+    length and content, and it was being printed verbatim into the model's
+    context — in a session that may sit in a public group. A mis-indented line
+    inside a chat entry turns a private note into a mapping KEY, and the refusal
+    published it. This file already refuses to quote a RULE for that reason; a
+    key carries the same and was not covered.
+
+    A name of ordinary shape is still shown, because `deney` and `bash_patern`
+    are the whole diagnostic value of the message. Anything else becomes its
+    position, which is enough to find the line.
+    """
+    out = []
+    for index, name in enumerate(names):
+        text = str(name)
+        out.append(text if KEY_SHAPE.match(text) else f'{where} key #{index + 1}')
+    return out
 
 
 def validated_deny(raw_policy: object, wanted_chat: str) -> dict:
@@ -290,13 +476,15 @@ def validated_deny(raw_policy: object, wanted_chat: str) -> dict:
     # A running session is proof its chat was in the file when the session
     # started. If it is not there now, the file changed underneath, and that is
     # the moment to stop rather than the moment to assume the best.
+    # `isinstance(..., bool)` first, because in Python `True == 1` — so
+    # `version: yes` (a boolean under YAML 1.1) satisfied `!= 1` and the file
+    # was applied while the loader rejected it. JsonishLoader now keeps `yes` a
+    # string, but the guard stays: it costs one call and it is the exact shape
+    # this check exists to refuse.
     if 'version' not in policy_map:
         problems.append('version is missing')
-    elif policy_map.get('version') != 1:
+    elif isinstance(policy_map.get('version'), bool) or policy_map.get('version') != 1:
         problems.append('version is not 1')
-
-    if 'chats' not in policy_map:
-        problems.append('the chats block is missing')
 
     # The same invariant at the top level, which the previous round applied to
     # chat entries and left off here. `MultichatPolicySchema` is `.strict()` and
@@ -308,7 +496,29 @@ def validated_deny(raw_policy: object, wanted_chat: str) -> dict:
         problems.append('missing top-level keys: ' + ', '.join(top_missing))
     top_stray = sorted({str(k) for k in policy_map} - set(TOP_REQUIRED))
     if top_stray:
-        problems.append('unknown top-level keys: ' + ', '.join(top_stray))
+        problems.append('unknown top-level keys: ' + ', '.join(safe_names(top_stray, 'top-level')))
+
+    # …and the inside of `allowlist`, which the key-name check could not see.
+    # These two lists decide WHO may reach the bot at all, so a file where they
+    # are the wrong shape is not a file to apply on a best-effort reading.
+    allowlist = policy_map.get('allowlist')
+    if 'allowlist' in policy_map:
+        if not isinstance(allowlist, dict):
+            problems.append('allowlist is not a mapping')
+        else:
+            for name in ALLOWLIST_KEYS:
+                if name not in allowlist:
+                    problems.append(f'allowlist.{name} is missing')
+                elif not _is_string_list(allowlist[name]):
+                    problems.append(f'allowlist.{name} is not a list of non-empty strings')
+            extra = sorted({str(k) for k in allowlist} - set(ALLOWLIST_KEYS))
+            if extra:
+                problems.append('unknown allowlist keys: ' + ', '.join(safe_names(extra, 'allowlist')))
+
+    if 'mention_allowlist' in policy_map and not _is_string_list(
+        policy_map.get('mention_allowlist')
+    ):
+        problems.append('mention_allowlist is not a list of non-empty strings')
 
     chats_map = policy_map.get('chats')
     if chats_map is None:
@@ -397,10 +607,39 @@ def validated_deny(raw_policy: object, wanted_chat: str) -> dict:
         entry_keys = {str(k) for k in value}
         stray = sorted(entry_keys - set(CHAT_KEYS))
         if stray:
-            problems.append(f'{where}: unknown keys: ' + ', '.join(stray))
+            problems.append(f'{where}: unknown keys: ' + ', '.join(safe_names(stray, 'entry')))
         missing = [name for name in CHAT_REQUIRED if name not in entry_keys]
         if missing:
             problems.append(f'{where}: missing keys: ' + ', '.join(missing))
+
+        # The VALUES, now that the hook and the loader agree on what a value is.
+        # `mode: admin`, `handoff_file: ""` and `idle_ttl_ms: 0` are files the
+        # loader rejects and this hook was applying.
+        for name, allowed in ENUM_FIELDS.items():
+            if name in entry_keys and value.get(name) not in allowed:
+                problems.append(f'{where}: {name} is not one of ' + ', '.join(allowed))
+        for name in BOOL_FIELDS:
+            if name in entry_keys and not isinstance(value.get(name), bool):
+                problems.append(f'{where}: {name} is not true or false')
+        for name in NONEMPTY_FIELDS:
+            got = value.get(name)
+            if name in entry_keys and (not isinstance(got, str) or not got):
+                problems.append(f'{where}: {name} is not a non-empty string')
+        for name in STRING_FIELDS:
+            if name in entry_keys and not isinstance(value.get(name), str):
+                problems.append(f'{where}: {name} is not a string')
+        # `z.number().int()` in JavaScript, where there is one number type: 1e3
+        # and 1800000.0 are integers there, and demanding a Python `int` would
+        # refuse a file the server accepts.
+        for name in POSITIVE_INT_FIELDS:
+            got = value.get(name)
+            if name in entry_keys and (
+                isinstance(got, bool)
+                or not isinstance(got, (int, float))
+                or float(got) != int(float(got))
+                or got <= 0
+            ):
+                problems.append(f'{where}: {name} is not a positive whole number')
 
         # An ABSENT `deny` is legitimate -- no rules for this chat has always
         # meant no denials. A `deny:` written with no value is not the same
@@ -416,7 +655,7 @@ def validated_deny(raw_policy: object, wanted_chat: str) -> dict:
 
         unknown = sorted(str(k) for k in deny_map if str(k) not in DENY_KEYS)
         if unknown:
-            problems.append(f'{where}: unknown deny keys: ' + ', '.join(unknown))
+            problems.append(f'{where}: unknown deny keys: ' + ', '.join(safe_names(unknown, 'deny')))
 
         # `mine` was decided above, comparing keys as TEXT on both sides: an
         # unquoted chat id is an int here and a string in the loader that
