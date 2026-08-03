@@ -212,68 +212,123 @@ except Exception:  # noqa: BLE001
     emit_block('policy.yaml did not parse (fail-safe deny)', 'hook-failure')
 
 
-def as_mapping(value: object, what: str) -> dict:
-    """Return ``value`` as a dict, denying if it is anything else.
+DENY_KEYS = ('mcp_tools', 'read_paths', 'bash_patterns')
 
-    A policy can be perfectly valid YAML and still be the wrong SHAPE -- a top
-    level list, `chats: []`, `deny: []`. Before this guard those shapes reached
-    `.get()` on a non-dict, raised AttributeError and killed the interpreter
-    with exit code 1. Claude blocks on exit 2 and ONLY on exit 2, so the
-    fail-safe hook was failing OPEN in exactly the corner it exists for. An
-    absent key is different and stays allowed: no rules for this chat has
-    always meant no denials.
+
+def validated_deny(raw_policy: object, wanted_chat: str) -> dict:
+    """Return this chat's deny lists, or refuse the call outright.
+
+    ONE strict pass over the whole policy, before anything looks at the call.
+
+    The previous rounds patched shapes one at a time -- a top-level list, then
+    `deny: []`, then a list given as a bare string, then those checks running
+    only for the tool they were about. Each fix was right and each left the next
+    shape open, because the question was being asked once per shape instead of
+    once. Review then found four more: an unquoted chat id (YAML makes it an
+    INT, the string lookup misses, and every rule for that chat silently
+    disappears while the server's own loader accepts the same file); a typo in a
+    deny key, which reads in the file exactly like a rule; a non-string element
+    inside an otherwise valid list, skipped in silence -- `[on, 007]` is
+    `[True, 7]` after YAML and matches nothing; and a report that named only the
+    FIRST broken key, so fixing the file took as many rounds as it had mistakes.
+
+    So the shape of a policy is settled here, once, on the same terms the
+    TypeScript loader already uses (`policy-loader.ts` is `.strict()` and pins
+    `version`): anything this hook cannot fully understand is a refusal, and
+    every complaint is collected before any is reported.
+
+    Nothing here prints a VALUE from policy.yaml -- only key names the operator
+    wrote and 1-based positions. A refusal that quotes the policy hands the
+    caller a piece of it, which is the class that already cost four rounds
+    elsewhere in this plugin.
     """
-    if value is None:
-        return {}
-    if not isinstance(value, dict):
-        emit_block(f'{what} is not a mapping (fail-safe deny)', 'hook-failure')
-    return value
+    problems: list[str] = []
+
+    policy_map = raw_policy if raw_policy is not None else {}
+    if not isinstance(policy_map, dict):
+        emit_block('policy.yaml root is not a mapping (fail-safe deny)', 'hook-failure')
+
+    version = policy_map.get('version')
+    if version is not None and version != 1:
+        problems.append('version is not 1')
+
+    chats_map = policy_map.get('chats')
+    if chats_map is None:
+        chats_map = {}
+    if not isinstance(chats_map, dict):
+        emit_block('policy.yaml chats is not a mapping (fail-safe deny)', 'hook-failure')
+
+    # Keys compared as TEXT on both sides: an unquoted chat id is an int here
+    # and a string in the loader that validated the same file.
+    entry = None
+    for key, value in chats_map.items():
+        if str(key) == wanted_chat:
+            entry = value
+            break
+
+    # No entry for this chat has always meant no denials, and still does.
+    if entry is None:
+        return {name: [] for name in DENY_KEYS}
+    if not isinstance(entry, dict):
+        emit_block('the chat entry is not a mapping (fail-safe deny)', 'hook-failure')
+
+    deny_map = entry.get('deny')
+    if deny_map is None:
+        deny_map = {}
+    if not isinstance(deny_map, dict):
+        emit_block('the deny block is not a mapping (fail-safe deny)', 'hook-failure')
+
+    unknown = sorted(str(k) for k in deny_map if str(k) not in DENY_KEYS)
+    if unknown:
+        problems.append('unknown deny keys: ' + ', '.join(unknown))
+
+    lists: dict = {}
+    for name in DENY_KEYS:
+        value = deny_map.get(name)
+        if value is None:
+            lists[name] = []
+            continue
+        if not isinstance(value, list):
+            problems.append(f'{name} is not a list')
+            lists[name] = []
+            continue
+        bad = [str(i + 1) for i, item in enumerate(value) if not isinstance(item, str)]
+        if bad:
+            problems.append(f'{name} has non-string rules at #' + ', #'.join(bad))
+        lists[name] = value
+
+    if problems:
+        emit_block(
+            'policy.yaml cannot be applied: ' + '; '.join(problems) + ' (fail-safe deny)',
+            'hook-failure',
+        )
+    return lists
 
 
-def as_sequence(value: object, what: str) -> list:
-    """Return ``value`` as a list, denying if it is anything else.
+deny_lists = validated_deny(policy, chat_id)
+mcp_tools = deny_lists['mcp_tools']
+read_paths = deny_lists['read_paths']
+bash_patterns = deny_lists['bash_patterns']
 
-    A bare string here would iterate CHARACTER by character and quietly match
-    almost nothing -- a deny list that silently stops denying.
-    """
-    if value is None:
-        return []
-    if not isinstance(value, list):
-        emit_block(f'{what} is not a list (fail-safe deny)', 'hook-failure')
-    return value
+# The tool call gets the same treatment as the policy, and for the same reason.
+# Unreadable JSON already denied; a readable object of the wrong shape --
+# `tool_input` as a string, the whole call as a list -- fell through to defaults
+# and was ALLOWED. That is the asymmetry this commit removes on the policy side,
+# left standing on the side an injected call actually controls.
+if not isinstance(tool_call, dict):
+    emit_block('the tool call is not an object (fail-safe deny)', 'hook-failure')
 
+raw_tool = tool_call.get('tool_name', '')
+if not isinstance(raw_tool, str):
+    emit_block('the tool call has no usable tool_name (fail-safe deny)', 'hook-failure')
+tool_name = raw_tool
 
-policy = as_mapping(policy, 'policy.yaml root')
-chats = as_mapping(policy.get('chats'), 'policy.yaml chats')
-chat_cfg = as_mapping(chats.get(chat_id), 'the chat entry')
-deny = as_mapping(chat_cfg.get('deny'), 'the deny block')
-
-# The SHAPE of the whole deny block is settled HERE, before anything looks at
-# which tool is calling.
-#
-# Validating each list inside the branch that consumes it made the refusal
-# depend on the caller: `read_paths: "secret"` is the same broken policy whether
-# a Read or a Bash arrives, but only the Read would have been refused. The Bash
-# ran, under a policy the hook had already failed to understand -- fail-open
-# wearing the fail-safe's clothes, and invisible because the tool that triggers
-# it is not the tool the broken list is about.
-#
-# A policy that does not parse is not a policy. It cannot be enforced for some
-# callers and waived for the rest.
-mcp_tools = as_sequence(deny.get('mcp_tools'), 'mcp_tools')
-read_paths = as_sequence(deny.get('read_paths'), 'read_paths')
-bash_patterns = as_sequence(deny.get('bash_patterns'), 'bash_patterns')
-
-# Defensive: tool_call may be malformed under prompt injection.
-tool_name = ''
-tool_input = {}
-if isinstance(tool_call, dict):
-    raw_tool = tool_call.get('tool_name', '')
-    if isinstance(raw_tool, str):
-        tool_name = raw_tool
-    raw_input = tool_call.get('tool_input', {})
-    if isinstance(raw_input, dict):
-        tool_input = raw_input
+raw_input = tool_call.get('tool_input')
+if raw_input is None:
+    raw_input = {}
+if not isinstance(raw_input, dict):
+    emit_block('tool_input is not an object (fail-safe deny)', 'hook-failure')
+tool_input = raw_input
 
 # A refusal names the RULE, never the rule's text. The pattern comes out of
 # policy.yaml and can carry a path or a token fragment; printing it hands the
@@ -288,16 +343,27 @@ for i, pattern in enumerate(mcp_tools):
     if isinstance(pattern, str) and fnmatch.fnmatch(tool_name, pattern):
         emit_block(rule_ref('mcp_tools', i))
 
-# 2) read_paths — only for tools that take a file path.
-PATH_TOOLS = {'Read', 'Edit', 'Write', 'NotebookEdit'}
-if tool_name in PATH_TOOLS:
-    candidate = tool_input.get('file_path') or tool_input.get('notebook_path') or ''
-    if isinstance(candidate, str) and candidate:
-        for i, pattern in enumerate(read_paths):
-            if not isinstance(pattern, str):
-                continue
-            if fnmatch.fnmatch(candidate, pattern):
-                emit_block(rule_ref('read_paths', i))
+# 2) read_paths — wherever the call names a path.
+#
+# This used to be an allowlist of tool NAMES, and the allowlist was short by
+# two: `MultiEdit` and `NotebookRead` take a path like everyone else and were
+# not on it, so on a perfectly correct policy a protected path could be read
+# through NotebookRead and written through MultiEdit. The multichat session runs
+# with bypassPermissions and names this hook as its only gate, so there was
+# nobody left to ask.
+#
+# The same mistake as the shape checks above, one layer down: the rule was made
+# to depend on WHICH tool arrived rather than on what the call is doing. A deny
+# list of paths applies wherever a path appears, and a tool added next month
+# gets it for free instead of getting an exemption for free.
+PATH_FIELDS = ('file_path', 'notebook_path', 'path')
+for field in PATH_FIELDS:
+    candidate = tool_input.get(field)
+    if not isinstance(candidate, str) or not candidate:
+        continue
+    for i, pattern in enumerate(read_paths):
+        if fnmatch.fnmatch(candidate, pattern):
+            emit_block(rule_ref('read_paths', i))
 
 # 3) bash_patterns — substring by default, fnmatch when meta present.
 if tool_name == 'Bash':

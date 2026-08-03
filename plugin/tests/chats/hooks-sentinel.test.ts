@@ -618,6 +618,226 @@ describe('pre-tool-use.sh — a block says which kind of block it is', () => {
     expect(r.stdout).toContain('bash_patterns deny')
     expect(JSON.parse(r.stdout).denied_by).toBe('policy')
   })
+
+  // Opus review, round 3. Only `bash_patterns` had a test that proves it ever
+  // MATCHES anything. Turning off the `read_paths` and `mcp_tools` comparisons
+  // outright left the suite green — two deny lists the tests had never seen
+  // work. A rule nothing exercises is a rule nobody will notice losing.
+  const POLICY_WITH_RULES = [
+    'version: 1',
+    'chats:',
+    '  "164795011":',
+    '    deny:',
+    '      mcp_tools:',
+    '        - "mcp__forbidden*"',
+    '      read_paths:',
+    '        - "/protected/*"',
+    '',
+  ].join('\n')
+
+  const POSITIVE_DENIES: ReadonlyArray<readonly [string, unknown, string]> = [
+    [
+      'an mcp tool matching the glob',
+      { tool_name: 'mcp__forbidden__do_it', tool_input: {} },
+      'mcp_tools deny',
+    ],
+    [
+      'Read of a protected path',
+      { tool_name: 'Read', tool_input: { file_path: '/protected/x' } },
+      'read_paths deny',
+    ],
+    // The two the allowlist of tool names was short by. Both take a path like
+    // everyone else, and the multichat session runs with bypassPermissions
+    // naming this hook as its only gate — so on a perfectly correct policy the
+    // protected path was readable through one and writable through the other.
+    [
+      'NotebookRead of a protected path',
+      { tool_name: 'NotebookRead', tool_input: { notebook_path: '/protected/x.ipynb' } },
+      'read_paths deny',
+    ],
+    [
+      'MultiEdit of a protected path',
+      { tool_name: 'MultiEdit', tool_input: { file_path: '/protected/x' } },
+      'read_paths deny',
+    ],
+    // Grep and Glob point at a directory in `path`, and a directory of
+    // protected files is read by searching it.
+    [
+      'Grep rooted at a protected path',
+      { tool_name: 'Grep', tool_input: { pattern: 'x', path: '/protected/dir' } },
+      'read_paths deny',
+    ],
+  ]
+
+  for (const [label, call, expected] of POSITIVE_DENIES) {
+    test(`the policy actually denies: ${label}`, () => {
+      writeFileSync(policyPath, POLICY_WITH_RULES, 'utf8')
+      const r = run(
+        PRE_HOOK,
+        {
+          MULTICHAT_STATE_DIR: workspace,
+          CLAUDE_WORKSPACE_DIR: workspace,
+          CHAT_ID: '164795011',
+        },
+        JSON.stringify(call),
+      )
+      expect(`${label}: ${r.code}`).toBe(`${label}: 2`)
+      const payload = JSON.parse(r.stdout)
+      expect(`${label}: ${payload.denied_by}`).toBe(`${label}: policy`)
+      expect(`${label}: ${payload.reason.startsWith(expected)}`).toBe(`${label}: true`)
+    })
+  }
+
+  // …and a call that matches nothing still runs. Both halves, always: a gate
+  // that denies everything is not a gate, it is an outage.
+  test('a call matching no rule is allowed', () => {
+    writeFileSync(policyPath, POLICY_WITH_RULES, 'utf8')
+    const r = run(
+      PRE_HOOK,
+      {
+        MULTICHAT_STATE_DIR: workspace,
+        CLAUDE_WORKSPACE_DIR: workspace,
+        CHAT_ID: '164795011',
+      },
+      JSON.stringify({ tool_name: 'Read', tool_input: { file_path: '/ordinary/x' } }),
+    )
+    expect(r.code).toBe(0)
+  })
+
+  // Opus review, round 3: four more ways the gate goes quiet without saying so.
+  // Each one is authored by hand in a YAML file, each reads as correct, and
+  // each turns some or all of the deny block into nothing.
+  // The quietest of the four, and the only one that is fixed by APPLYING the
+  // policy rather than by refusing it: an unquoted chat id is an int key in
+  // YAML, so the string lookup missed and the chat silently got no rules at
+  // all — while the server's own loader accepted the same file (js-yaml gives
+  // it a string key) and brought the session up. Keys are compared as text now.
+  test('an unquoted chat id still gets its rules', () => {
+    writeFileSync(
+      policyPath,
+      'version: 1\nchats:\n  164795011:\n    deny:\n      bash_patterns:\n        - "sudo"\n',
+      'utf8',
+    )
+    const r = run(
+      PRE_HOOK,
+      {
+        MULTICHAT_STATE_DIR: workspace,
+        CLAUDE_WORKSPACE_DIR: workspace,
+        CHAT_ID: '164795011',
+      },
+      JSON.stringify({ tool_name: 'Bash', tool_input: { command: 'sudo id' } }),
+    )
+    expect(r.code).toBe(2)
+    expect(JSON.parse(r.stdout).denied_by).toBe('policy')
+  })
+
+  const QUIET: ReadonlyArray<readonly [string, string]> = [
+    [
+      'a typo in a deny key — reads like a rule, is not one',
+      'version: 1\nchats:\n  "164795011":\n    deny:\n      bash_patern:\n        - "rm"\n',
+    ],
+    [
+      'non-string rules inside a valid list — [on, 007] is [True, 7] after YAML',
+      'version: 1\nchats:\n  "164795011":\n    deny:\n      bash_patterns:\n        - on\n        - 007\n',
+    ],
+    [
+      'a version this hook does not know',
+      'version: 2\nchats:\n  "164795011":\n    deny:\n      bash_patterns:\n        - "rm"\n',
+    ],
+  ]
+
+  for (const [label, yaml] of QUIET) {
+    test(`a policy that would silently stop denying is refused: ${label}`, () => {
+      writeFileSync(policyPath, yaml, 'utf8')
+      const r = run(
+        PRE_HOOK,
+        {
+          MULTICHAT_STATE_DIR: workspace,
+          CLAUDE_WORKSPACE_DIR: workspace,
+          CHAT_ID: '164795011',
+        },
+        JSON.stringify({ tool_name: 'Bash', tool_input: { command: 'ls' } }),
+      )
+      expect(`${label}: ${r.code}`).toBe(`${label}: 2`)
+      expect(`${label}: ${JSON.parse(r.stdout).denied_by}`).toBe(`${label}: hook-failure`)
+    })
+  }
+
+  // Every complaint at once. Naming only the first costs the operator one
+  // round of editing per mistake, in a file where every mistake locks the chat.
+  test('a policy with several mistakes names all of them', () => {
+    writeFileSync(
+      policyPath,
+      'version: 1\nchats:\n  "164795011":\n    deny:\n      read_paths: "x"\n      bash_patterns: "y"\n      typo_key: []\n',
+      'utf8',
+    )
+    const r = run(
+      PRE_HOOK,
+      {
+        MULTICHAT_STATE_DIR: workspace,
+        CLAUDE_WORKSPACE_DIR: workspace,
+        CHAT_ID: '164795011',
+      },
+      JSON.stringify({ tool_name: 'Bash', tool_input: { command: 'ls' } }),
+    )
+    expect(r.code).toBe(2)
+    const reason = JSON.parse(r.stdout).reason
+    expect(reason).toContain('read_paths is not a list')
+    expect(reason).toContain('bash_patterns is not a list')
+    expect(reason).toContain('typo_key')
+  })
+
+  // The shape complaint must not quote the policy either. `matched_fragment`
+  // cost four rounds by leaking on the match path; this is the same leak one
+  // branch over, and until now nothing tested it.
+  test('a shape refusal names the key, never the offending value', () => {
+    writeFileSync(
+      policyPath,
+      'version: 1\nchats:\n  "164795011":\n    deny:\n      read_paths: "sekrit-path-fragment"\n',
+      'utf8',
+    )
+    const r = run(
+      PRE_HOOK,
+      {
+        MULTICHAT_STATE_DIR: workspace,
+        CLAUDE_WORKSPACE_DIR: workspace,
+        CHAT_ID: '164795011',
+      },
+      JSON.stringify({ tool_name: 'Bash', tool_input: { command: 'ls' } }),
+    )
+    expect(r.code).toBe(2)
+    expect(r.stdout).not.toContain('sekrit-path-fragment')
+    expect(r.stderr).not.toContain('sekrit-path-fragment')
+    expect(JSON.parse(r.stdout).reason).toContain('read_paths is not a list')
+  })
+
+  // The tool call is the half an injected prompt actually controls. Unreadable
+  // JSON already denied; readable JSON of the wrong shape fell through to
+  // defaults and was allowed — the same asymmetry, on the more exposed side.
+  const MALFORMED_CALLS: ReadonlyArray<readonly [string, string]> = [
+    ['the call is a list', '[]'],
+    ['the call is a string', '"Bash"'],
+    ['tool_name is not a string', '{"tool_name": 42, "tool_input": {}}'],
+    ['tool_input is a string', '{"tool_name": "Bash", "tool_input": "ls"}'],
+    ['tool_input is a list', '{"tool_name": "Bash", "tool_input": []}'],
+  ]
+
+  for (const [label, body] of MALFORMED_CALLS) {
+    test(`a tool call of the wrong shape denies: ${label}`, () => {
+      writeFileSync(policyPath, POLICY_WITH_RULES, 'utf8')
+      const r = run(
+        PRE_HOOK,
+        {
+          MULTICHAT_STATE_DIR: workspace,
+          CLAUDE_WORKSPACE_DIR: workspace,
+          CHAT_ID: '164795011',
+        },
+        body,
+      )
+      expect(`${label}: ${r.code}`).toBe(`${label}: 2`)
+      expect(`${label}: ${JSON.parse(r.stdout).denied_by}`).toBe(`${label}: hook-failure`)
+    })
+  }
 })
 
 describe('session-start.sh — sentinel pass-through', () => {
