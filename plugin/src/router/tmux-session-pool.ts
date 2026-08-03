@@ -225,6 +225,15 @@ export interface TmuxSessionPoolOptions {
   //
   // Defaults to `{workspaceDir}/chats` when omitted.
   chatsBasePath?: string
+  // The policy.yaml this server actually loaded, exported into every chat
+  // session as TELEGRAM_MULTICHAT_POLICY_PATH.
+  //
+  // Without it the PreToolUse gate falls back to `{workspaceDir}/chats/
+  // policy.yaml` while the server validated a different file — so on a
+  // deployment using `config.multichat.policy_path`, the two disagree about
+  // what the rules ARE. If the default file happens to exist and be weaker,
+  // that is not a lockout but a wrong allow.
+  policyPath?: string
   claudeBinary?: string
   // Optional wrapper script. When set, our spawn-chat-shell.sh wrapper
   // (which runs `env -i` and re-exports the allowlisted vars) execs
@@ -264,6 +273,7 @@ export class TmuxSessionPool {
   private readonly stateDir: string
   private readonly workspaceDir: string
   private readonly chatsBasePath: string
+  private readonly policyPath: string
   private readonly claudeBinary: string
   private readonly entrypointScript: string | undefined
   private readonly spawnWrapperPath: string
@@ -289,6 +299,9 @@ export class TmuxSessionPool {
     // hooks registration. Default mirrors the canonical Thrall layout
     // (`{workspace}/chats/.claude/settings.json`).
     this.chatsBasePath = opts.chatsBasePath ?? join(opts.workspaceDir, 'chats')
+    // Same default the hook falls back to, so the two agree when nothing is
+    // configured and agree explicitly when something is.
+    this.policyPath = opts.policyPath ?? join(opts.workspaceDir, 'chats', 'policy.yaml')
     this.claudeBinary = opts.claudeBinary ?? 'claude'
     this.entrypointScript = opts.entrypointScript
     this.spawnWrapperPath = opts.spawnWrapperPath ?? DEFAULT_SPAWN_WRAPPER_PATH
@@ -733,6 +746,8 @@ export class TmuxSessionPool {
       `MULTICHAT_STATE_DIR=${this.stateDir}`,
       '-e',
       `CLAUDE_WORKSPACE_DIR=${this.workspaceDir}`,
+      '-e',
+      `TELEGRAM_MULTICHAT_POLICY_PATH=${this.policyPath}`,
     ]
     // Opus MED-B #22 (2026-05-27): sort childEnv entries by key before
     // emitting `-e KEY=VAL` pairs. `Object.entries` order is

@@ -39,7 +39,10 @@ if [[ -z "${CHAT_ID:-}" ]]; then
 fi
 
 WORKSPACE="${CLAUDE_WORKSPACE_DIR:-${HOME}/.claude-lab/thrall/.claude}"
-POLICY_PATH="${WORKSPACE}/chats/policy.yaml"
+# The second consumer of policy.yaml in this session, and it had the same
+# hard-coded default as the gate: with a configured `policy_path` the reminder
+# and persona context came from a file the server never loaded.
+POLICY_PATH="${TELEGRAM_MULTICHAT_POLICY_PATH:-${WORKSPACE}/chats/policy.yaml}"
 PERSONA_PATH="${WORKSPACE}/chats/${CHAT_ID}/persona.md"
 
 if ! command -v python3 >/dev/null 2>&1; then

@@ -1208,6 +1208,11 @@ if (
       chatsBasePath,
       claudeBinary,
       logger: log,
+      // The file THIS server loaded, so the PreToolUse gate reads the same one.
+      // Resolved above from config.multichat.policy_path /
+      // TELEGRAM_MULTICHAT_POLICY_PATH; passing it on is what makes the hook's
+      // env override reachable in practice rather than only in a test.
+      ...(multichatPolicyPath ? { policyPath: multichatPolicyPath } : {}),
       ...(entrypointExists ? { entrypointScript } : {}),
     })
     multichatRouter = new MultichatRouter({

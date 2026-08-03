@@ -484,6 +484,36 @@ describe('TmuxSessionPool end-to-end env sanitization', () => {
     expect(argv).toContain('CHAT_ID=-100')
     expect(argv).toContain(`MULTICHAT_STATE_DIR=${fixture.stateDir}`)
     expect(argv).toContain('CLAUDE_WORKSPACE_DIR=/tmp/ws')
+    // With nothing configured the session is told the same default the
+    // PreToolUse gate would have fallen back to anyway — stated rather than
+    // left to two copies of the same string agreeing by luck.
+    expect(argv).toContain('TELEGRAM_MULTICHAT_POLICY_PATH=/tmp/ws/chats/policy.yaml')
+  })
+
+  // The half of the policy-path fix that lives outside the hook. The hook reads
+  // TELEGRAM_MULTICHAT_POLICY_PATH, but nothing put it in the session's env, so
+  // on a deployment with `config.multichat.policy_path` the server validated one
+  // file and the gate enforced another. A hook test that sets the variable
+  // itself stays green with the export missing — which is exactly how this got
+  // through the first time.
+  test('a configured policy path is forwarded to the session that must enforce it', async () => {
+    if (fixture === undefined) throw new Error('fixture missing')
+
+    const pool = new TmuxSessionPool({
+      policy: makePolicy('-101'),
+      stateDir: fixture.stateDir,
+      workspaceDir: '/tmp/ws',
+      chatsBasePath: '/tmp/ws/chats',
+      policyPath: '/etc/thrall/custom-policy.yaml',
+      claudeBinary: 'claude',
+      logger: nopLogger(),
+    })
+
+    await pool.getOrSpawn('-101')
+
+    const argv = readFileSync(fixture.argvLog, 'utf8')
+    expect(argv).toContain('TELEGRAM_MULTICHAT_POLICY_PATH=/etc/thrall/custom-policy.yaml')
+    expect(argv).not.toContain('TELEGRAM_MULTICHAT_POLICY_PATH=/tmp/ws/chats/policy.yaml')
   })
 
   test('non-allowlisted but non-forbidden key (HOSTNAME) is dropped', async () => {
