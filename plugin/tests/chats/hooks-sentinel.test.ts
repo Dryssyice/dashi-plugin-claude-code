@@ -537,6 +537,57 @@ describe('pre-tool-use.sh — a block says which kind of block it is', () => {
     })
   }
 
+  // codex review round 3, MUST — and the same defect one layer in. Round 2 made
+  // a wrong-shaped deny list refuse; it refused only when the tool that arrived
+  // was the tool that list is about. `read_paths: "secret"` was checked inside
+  // `if tool_name in PATH_TOOLS`, so a Bash call sailed past a policy the hook
+  // had already failed to understand.
+  //
+  // That is fail-open wearing the fail-safe's clothes, and it is invisible from
+  // the inside: the broken list belongs to a tool nobody is calling, so nothing
+  // ever complains. The shape of the whole deny block is now settled before the
+  // hook looks at which tool is calling.
+  const CROSS_TOOL: ReadonlyArray<readonly [string, string, unknown]> = [
+    [
+      'read_paths broken, a Bash call arrives',
+      'version: 1\nchats:\n  "164795011":\n    deny:\n      read_paths: "secret"\n',
+      { tool_name: 'Bash', tool_input: { command: 'ls' } },
+    ],
+    [
+      'bash_patterns broken, a Read call arrives',
+      'version: 1\nchats:\n  "164795011":\n    deny:\n      bash_patterns: "rm"\n',
+      { tool_name: 'Read', tool_input: { file_path: '/tmp/harmless.txt' } },
+    ],
+    [
+      'read_paths broken, a Read call arrives with no path at all',
+      'version: 1\nchats:\n  "164795011":\n    deny:\n      read_paths: "secret"\n',
+      { tool_name: 'Read', tool_input: {} },
+    ],
+    [
+      'mcp_tools broken, a Bash call arrives',
+      'version: 1\nchats:\n  "164795011":\n    deny:\n      mcp_tools: "mcp__*"\n',
+      { tool_name: 'Bash', tool_input: { command: 'ls' } },
+    ],
+  ]
+
+  for (const [label, yaml, call] of CROSS_TOOL) {
+    test(`a broken policy denies whoever calls: ${label}`, () => {
+      writeFileSync(policyPath, yaml, 'utf8')
+      const r = run(
+        PRE_HOOK,
+        {
+          MULTICHAT_STATE_DIR: workspace,
+          CLAUDE_WORKSPACE_DIR: workspace,
+          CHAT_ID: '164795011',
+        },
+        JSON.stringify(call),
+      )
+      expect(`${label}: ${r.code}`).toBe(`${label}: 2`)
+      const payload = JSON.parse(r.stdout)
+      expect(`${label}: ${payload.denied_by}`).toBe(`${label}: hook-failure`)
+    })
+  }
+
   // Same class as the plugin's `matched_fragment` leak: a refusal must not hand
   // back a piece of the policy. The rule is named by kind and position instead.
   test('a policy deny names the rule, never the rule text', () => {

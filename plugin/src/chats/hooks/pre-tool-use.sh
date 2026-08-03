@@ -248,6 +248,22 @@ chats = as_mapping(policy.get('chats'), 'policy.yaml chats')
 chat_cfg = as_mapping(chats.get(chat_id), 'the chat entry')
 deny = as_mapping(chat_cfg.get('deny'), 'the deny block')
 
+# The SHAPE of the whole deny block is settled HERE, before anything looks at
+# which tool is calling.
+#
+# Validating each list inside the branch that consumes it made the refusal
+# depend on the caller: `read_paths: "secret"` is the same broken policy whether
+# a Read or a Bash arrives, but only the Read would have been refused. The Bash
+# ran, under a policy the hook had already failed to understand -- fail-open
+# wearing the fail-safe's clothes, and invisible because the tool that triggers
+# it is not the tool the broken list is about.
+#
+# A policy that does not parse is not a policy. It cannot be enforced for some
+# callers and waived for the rest.
+mcp_tools = as_sequence(deny.get('mcp_tools'), 'mcp_tools')
+read_paths = as_sequence(deny.get('read_paths'), 'read_paths')
+bash_patterns = as_sequence(deny.get('bash_patterns'), 'bash_patterns')
+
 # Defensive: tool_call may be malformed under prompt injection.
 tool_name = ''
 tool_input = {}
@@ -268,7 +284,7 @@ def rule_ref(section: str, index: int) -> str:
 
 
 # 1) mcp_tools / tool-name deny — fnmatch globs.
-for i, pattern in enumerate(as_sequence(deny.get('mcp_tools'), 'mcp_tools')):
+for i, pattern in enumerate(mcp_tools):
     if isinstance(pattern, str) and fnmatch.fnmatch(tool_name, pattern):
         emit_block(rule_ref('mcp_tools', i))
 
@@ -277,7 +293,7 @@ PATH_TOOLS = {'Read', 'Edit', 'Write', 'NotebookEdit'}
 if tool_name in PATH_TOOLS:
     candidate = tool_input.get('file_path') or tool_input.get('notebook_path') or ''
     if isinstance(candidate, str) and candidate:
-        for i, pattern in enumerate(as_sequence(deny.get('read_paths'), 'read_paths')):
+        for i, pattern in enumerate(read_paths):
             if not isinstance(pattern, str):
                 continue
             if fnmatch.fnmatch(candidate, pattern):
@@ -288,7 +304,7 @@ if tool_name == 'Bash':
     command = tool_input.get('command') or ''
     if isinstance(command, str):
         cmd_lower = command.lower()
-        for i, pattern in enumerate(as_sequence(deny.get('bash_patterns'), 'bash_patterns')):
+        for i, pattern in enumerate(bash_patterns):
             if not isinstance(pattern, str):
                 continue
             pat_lower = pattern.lower()
