@@ -83,9 +83,21 @@ function entry(id: string, extra = ''): string {
   return `  "${id}":\n${REQUIRED_FIELDS}\n${tail}`
 }
 
+// The top level `MultichatPolicySchema` requires. Left out of the first version
+// of this helper, which meant «legitimate» fixtures were still files the loader
+// rejects — the same substitution one level up from the one it was written to
+// remove.
+const TOP_FIELDS = [
+  'version: 1',
+  'allowlist:',
+  '  chats: ["164795011"]',
+  '  users: ["abramov_aicreator"]',
+  'mention_allowlist: ["abramov_aicreator"]',
+].join('\n')
+
 /** A whole policy.yaml around one or more entries. */
 function policyOf(...entries: string[]): string {
-  return `version: 1\nchats:\n${entries.join('')}`
+  return `${TOP_FIELDS}\nchats:\n${entries.join('')}`
 }
 
 let workspace: string
@@ -1153,6 +1165,26 @@ describe('pre-tool-use.sh — a block says which kind of block it is', () => {
   // hook would make the hook refuse every call in every chat, live, with a
   // correct file on disk. That failure belongs in CI, not in the operator's
   // evening — so the two lists are compared directly, in the same repo.
+  // The check that ends the whole class of finding, rather than one more
+  // instance of it. Twice now a reviewer has pointed out that the fixtures the
+  // suite calls «legitimate» are files the real loader would throw on — first at
+  // the chat entry, then at the top level. So the builder's own output is fed to
+  // the real schema here: if it drifts again, this test says so, and no future
+  // round has to notice by eye.
+  test('the fixture builder produces a policy the real loader accepts', async () => {
+    const { MultichatPolicySchema } = await import('../../src/chats/policy-loader')
+    const { JSON_SCHEMA, load } = await import('js-yaml')
+    const parsed = load(
+      policyOf(
+        entry('164795011', ['    deny:', '      bash_patterns:', '        - "rm"'].join('\n')),
+        entry('999'),
+      ),
+      { schema: JSON_SCHEMA },
+    )
+    const result = MultichatPolicySchema.safeParse(parsed)
+    expect(result.success ? 'accepted' : JSON.stringify(result.error.issues)).toBe('accepted')
+  })
+
   test('the hook’s chat-entry key lists match ChatPolicySchema exactly', async () => {
     const { ChatPolicySchema } = await import('../../src/chats/policy-loader')
     const hookSource = readFileSync(PRE_HOOK, 'utf8')
@@ -1182,7 +1214,54 @@ describe('pre-tool-use.sh — a block says which kind of block it is', () => {
     // …and the hook must actually build its accepted set from both, or the two
     // lists above could be perfect while the check used only one of them.
     expect(hookSource).toContain('CHAT_KEYS = CHAT_REQUIRED + CHAT_OPTIONAL')
+
+    // The top level, pinned the same way. It has no optional fields, so one
+    // list is both «required» and «all allowed» — and if the schema ever grows
+    // an optional one, this equality is what notices.
+    const { MultichatPolicySchema } = await import('../../src/chats/policy-loader')
+    expect(namesIn('TOP_REQUIRED')).toEqual(Object.keys(MultichatPolicySchema.shape).sort())
   })
+
+  // The top-level half of the invariant, missing until codex asked for it a
+  // second time: a policy without `allowlist` / `mention_allowlist` is one the
+  // server would refuse to load, and the gate was applying it.
+  const TOP_LEVEL_BROKEN: ReadonlyArray<readonly [string, string, string]> = [
+    [
+      'no allowlist at all',
+      'version: 1\nmention_allowlist: []\nchats:\n  "164795011": {}\n',
+      'missing top-level keys: allowlist',
+    ],
+    [
+      'neither allowlist nor mention_allowlist',
+      'version: 1\nchats:\n  "164795011": {}\n',
+      'missing top-level keys: allowlist, mention_allowlist',
+    ],
+    [
+      'a top-level key the schema has never had',
+      'version: 1\nallowlist:\n  chats: []\n  users: []\nmention_allowlist: []\n' +
+        'chats:\n  "164795011": {}\nbypass: true\n',
+      'unknown top-level keys: bypass',
+    ],
+  ]
+
+  for (const [label, yaml, phrase] of TOP_LEVEL_BROKEN) {
+    test(`a policy the loader would reject at the top level is refused: ${label}`, () => {
+      writeFileSync(policyPath, yaml, 'utf8')
+      const r = run(
+        PRE_HOOK,
+        {
+          MULTICHAT_STATE_DIR: workspace,
+          CLAUDE_WORKSPACE_DIR: workspace,
+          CHAT_ID: '164795011',
+        },
+        JSON.stringify({ tool_name: 'Bash', tool_input: { command: 'ls' } }),
+      )
+      expect(`${label}: ${r.code}`).toBe(`${label}: 2`)
+      const payload = JSON.parse(r.stdout)
+      expect(`${label}: ${payload.denied_by}`).toBe(`${label}: hook-failure`)
+      expect(`${label}: ${payload.reason.includes(phrase)}`).toBe(`${label}: true`)
+    })
+  }
 
   // The 1-based position is the ONLY navigation the operator gets, because the
   // rule text is deliberately never printed. An off-by-one sends them to edit

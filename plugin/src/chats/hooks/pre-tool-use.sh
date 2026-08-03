@@ -233,6 +233,10 @@ CHAT_REQUIRED = (
 CHAT_OPTIONAL = ('deny', 'idle_ttl_ms', 'max_queue_depth')
 CHAT_KEYS = CHAT_REQUIRED + CHAT_OPTIONAL
 
+# The top level of `MultichatPolicySchema`, which is `.strict()` with no
+# optional fields — so one list serves as both «required» and «all allowed».
+TOP_REQUIRED = ('version', 'allowlist', 'mention_allowlist', 'chats')
+
 
 def validated_deny(raw_policy: object, wanted_chat: str) -> dict:
     """Return this chat's deny lists, or refuse the call outright.
@@ -293,6 +297,18 @@ def validated_deny(raw_policy: object, wanted_chat: str) -> dict:
 
     if 'chats' not in policy_map:
         problems.append('the chats block is missing')
+
+    # The same invariant at the top level, which the previous round applied to
+    # chat entries and left off here. `MultichatPolicySchema` is `.strict()` and
+    # requires `allowlist` and `mention_allowlist` too; a file without them is a
+    # file the server would not have loaded, and the gate has no business
+    # applying one. Names only, for the coercion reason spelled out below.
+    top_missing = [name for name in TOP_REQUIRED if name not in policy_map]
+    if top_missing:
+        problems.append('missing top-level keys: ' + ', '.join(top_missing))
+    top_stray = sorted({str(k) for k in policy_map} - set(TOP_REQUIRED))
+    if top_stray:
+        problems.append('unknown top-level keys: ' + ', '.join(top_stray))
 
     chats_map = policy_map.get('chats')
     if chats_map is None:
