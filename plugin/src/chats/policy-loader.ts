@@ -91,6 +91,28 @@ export function loadPolicy(basePath: string): MultichatPolicy {
 }
 
 /**
+ * Where the policy lives when nothing configured it.
+ *
+ * This string exists twice by necessity — once here, once as the shell
+ * fallback `${TELEGRAM_MULTICHAT_POLICY_PATH:-${WORKSPACE}/chats/policy.yaml}`
+ * in `pre-tool-use.sh` and `session-start.sh`, which must still work if the
+ * variable never arrives. Two copies that must agree is exactly the shape that
+ * produced the bug this whole chain fixes, so they are not left to agree by
+ * luck: `server.boot.test.ts` reads the literal out of both hook scripts and
+ * compares it with what this function returns.
+ *
+ * It is a function and not a constant so the pool cannot quietly acquire a
+ * default of its own again — the value is decided once, in server.ts, and
+ * handed down.
+ *
+ * @param workspaceDir the multichat workspace root
+ * @returns absolute path to the default policy file
+ */
+export function defaultMultichatPolicyPath(workspaceDir: string): string {
+  return join(workspaceDir, 'chats', 'policy.yaml')
+}
+
+/**
  * Load and validate a policy YAML from an EXACT absolute file path.
  *
  * FIX-G / M3 (Codex review 2026-05-27 #4): server.ts used to treat the

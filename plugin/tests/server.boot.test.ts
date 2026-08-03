@@ -22,7 +22,14 @@ import { mkdtempSync, rmSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 
-import { loadPolicyFromPath } from '../src/chats/policy-loader.js'
+import { readFileSync } from 'fs'
+
+import {
+  defaultMultichatPolicyPath,
+  loadPolicyFromPath,
+} from '../src/chats/policy-loader.js'
+
+const HOOKS_DIR = join(import.meta.dir, '..', 'src', 'chats', 'hooks')
 
 let workDir: string
 
@@ -210,5 +217,54 @@ describe('FIX-G / M3 — loadPolicyFromPath honours EXACT file path', () => {
     })
     const policy = loadPolicy(workDir)
     expect(policy.version).toBe(1)
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────
+// The server's default policy path vs the hooks' own fallback.
+//
+// The same location is written down twice and has to be: server.ts decides it
+// in TypeScript, and each hook keeps `${TELEGRAM_MULTICHAT_POLICY_PATH:-...}`
+// so it still works if the variable never arrives. Two copies that must agree
+// is precisely the shape that caused the gate to enforce a different file than
+// the server validated. These tests compare them instead of trusting them —
+// the hook literal is READ OUT of the shipped script, so editing one side and
+// not the other turns this red.
+// ─────────────────────────────────────────────────────────────────────
+
+describe('default policy path agrees with the hooks that fall back to it', () => {
+  // Anchored to a LIVE assignment at column 0, not to the literal appearing
+  // anywhere in the file. Measured: the unanchored version passed against a
+  // hook that hardcoded the path and kept the old line as a `# was: ...`
+  // comment — an assertion satisfied by prose. `^...=` at line start with the
+  // `m` flag excludes comments and indented env-prefix uses.
+  //
+  // What this pair of tests proves and does NOT prove: it proves the two
+  // written-down copies of the DEFAULT agree. It cannot prove the hook honours
+  // the variable at runtime — a reassignment on the following line defeats any
+  // source regex. That is proved behaviourally, by running each hook against
+  // two policy files: hooks-sentinel.test.ts, «TELEGRAM_MULTICHAT_POLICY_PATH
+  // is the file the hook reads», once per hook.
+  const FALLBACK = /^POLICY_PATH="\$\{TELEGRAM_MULTICHAT_POLICY_PATH:-\$\{WORKSPACE\}([^}"]*)\}"/m
+
+  for (const hook of ['pre-tool-use.sh', 'session-start.sh']) {
+    test(`${hook} falls back to the path defaultMultichatPolicyPath builds`, () => {
+      const script = readFileSync(join(HOOKS_DIR, hook), 'utf8')
+      const match = FALLBACK.exec(script)
+      // A hook that stopped honouring the variable at all would leave no match
+      // — that is a failure, not a pass. Round 11's whole defect was a hook
+      // reading a path nobody could redirect.
+      expect(match).not.toBeNull()
+      const tail = match?.[1] ?? ''
+      expect(defaultMultichatPolicyPath('/ws')).toBe(`/ws${tail}`)
+    })
+  }
+
+  test('the default is derived from the workspace, not a fixed string', () => {
+    // Guards the mutation that makes the function ignore its argument and
+    // return one hard-coded path: every caller would then get the same file
+    // regardless of workspace, and the per-hook comparison above would still
+    // pass for whichever workspace it happened to be pinned to.
+    expect(defaultMultichatPolicyPath('/a')).not.toBe(defaultMultichatPolicyPath('/b'))
   })
 })

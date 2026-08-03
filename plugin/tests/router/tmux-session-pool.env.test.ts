@@ -402,6 +402,7 @@ describe('TmuxSessionPool end-to-end env sanitization', () => {
       stateDir: fixture.stateDir,
       workspaceDir: '/tmp/ws',
       chatsBasePath: '/tmp/ws/chats',
+      policyPath: '/tmp/ws/chats/policy.yaml',
       claudeBinary: 'claude',
       logger: nopLogger(),
     })
@@ -440,6 +441,7 @@ describe('TmuxSessionPool end-to-end env sanitization', () => {
       stateDir: fixture.stateDir,
       workspaceDir: '/tmp/ws',
       chatsBasePath: '/tmp/ws/chats',
+      policyPath: '/tmp/ws/chats/policy.yaml',
       claudeBinary: 'claude',
       logger: nopLogger(),
     })
@@ -474,6 +476,12 @@ describe('TmuxSessionPool end-to-end env sanitization', () => {
       stateDir: fixture.stateDir,
       workspaceDir: '/tmp/ws',
       chatsBasePath: '/tmp/ws/chats',
+      // Deliberately NOT `{workspaceDir}/chats/policy.yaml` and not
+      // `{chatsBasePath}/policy.yaml`: with either, this assertion passes for a
+      // pool that derives the path from something else entirely instead of
+      // forwarding what it was given. Measured — with the matching default here
+      // a pool rewritten to use chatsBasePath left this test green.
+      policyPath: '/tmp/ws/SOMEWHERE-ELSE/policy.yaml',
       claudeBinary: 'claude',
       logger: nopLogger(),
     })
@@ -484,6 +492,57 @@ describe('TmuxSessionPool end-to-end env sanitization', () => {
     expect(argv).toContain('CHAT_ID=-100')
     expect(argv).toContain(`MULTICHAT_STATE_DIR=${fixture.stateDir}`)
     expect(argv).toContain('CLAUDE_WORKSPACE_DIR=/tmp/ws')
+    // The pool forwards the path it was GIVEN, unmodified. It no longer has a
+    // default to fall back to — `policyPath` is required, so there is exactly
+    // one place the value is decided (server.ts) instead of two that have to
+    // keep agreeing. That the decided default matches the hooks' own fallback
+    // is pinned in server.boot.test.ts, against the hook scripts themselves.
+    expect(argv).toContain('TELEGRAM_MULTICHAT_POLICY_PATH=/tmp/ws/SOMEWHERE-ELSE/policy.yaml')
+  })
+
+  // The half of the policy-path fix that lives outside the hook. The hook reads
+  // TELEGRAM_MULTICHAT_POLICY_PATH, but nothing put it in the session's env, so
+  // on a deployment with `config.multichat.policy_path` the server validated one
+  // file and the gate enforced another. A hook test that sets the variable
+  // itself stays green with the export missing — which is exactly how this got
+  // through the first time.
+  test('a configured policy path is forwarded to the session that must enforce it', async () => {
+    if (fixture === undefined) throw new Error('fixture missing')
+
+    const pool = new TmuxSessionPool({
+      policy: makePolicy('-101'),
+      stateDir: fixture.stateDir,
+      workspaceDir: '/tmp/ws',
+      chatsBasePath: '/tmp/ws/chats',
+      policyPath: '/etc/thrall/custom-policy.yaml',
+      claudeBinary: 'claude',
+      logger: nopLogger(),
+    })
+
+    await pool.getOrSpawn('-101')
+
+    const argv = readFileSync(fixture.argvLog, 'utf8')
+    expect(argv).toContain('TELEGRAM_MULTICHAT_POLICY_PATH=/etc/thrall/custom-policy.yaml')
+    expect(argv).not.toContain('TELEGRAM_MULTICHAT_POLICY_PATH=/tmp/ws/chats/policy.yaml')
+  })
+
+  test('an empty policyPath is refused, not quietly treated as unset', () => {
+    if (fixture === undefined) throw new Error('fixture missing')
+    // The type says `string`, and '' is a string. Both hooks read
+    // `${VAR:-default}`, so an empty export is indistinguishable from a missing
+    // one — the silent fallback the required option was meant to close.
+    expect(
+      () =>
+        new TmuxSessionPool({
+          policy: makePolicy('-102'),
+          stateDir: fixture!.stateDir,
+          workspaceDir: '/tmp/ws',
+          chatsBasePath: '/tmp/ws/chats',
+          policyPath: '',
+          claudeBinary: 'claude',
+          logger: nopLogger(),
+        }),
+    ).toThrow(/policyPath must not be empty/)
   })
 
   test('non-allowlisted but non-forbidden key (HOSTNAME) is dropped', async () => {
@@ -497,6 +556,7 @@ describe('TmuxSessionPool end-to-end env sanitization', () => {
       stateDir: fixture.stateDir,
       workspaceDir: '/tmp/ws',
       chatsBasePath: '/tmp/ws/chats',
+      policyPath: '/tmp/ws/chats/policy.yaml',
       claudeBinary: 'claude',
       logger: nopLogger(),
     })
@@ -523,6 +583,7 @@ describe('TmuxSessionPool end-to-end env sanitization', () => {
       stateDir: fixture.stateDir,
       workspaceDir: '/tmp/ws',
       chatsBasePath: '/tmp/ws/chats',
+      policyPath: '/tmp/ws/chats/policy.yaml',
       claudeBinary: 'claude',
       logger: nopLogger(),
     })
@@ -558,6 +619,7 @@ describe('TmuxSessionPool end-to-end env sanitization', () => {
       stateDir: fixture.stateDir,
       workspaceDir: '/tmp/ws',
       chatsBasePath: '/tmp/ws/chats',
+      policyPath: '/tmp/ws/chats/policy.yaml',
       claudeBinary: 'claude',
       logger: nopLogger(),
     })
@@ -586,6 +648,7 @@ describe('TmuxSessionPool end-to-end env sanitization', () => {
       stateDir: fixture.stateDir,
       workspaceDir: '/tmp/ws',
       chatsBasePath: '/tmp/ws/chats',
+      policyPath: '/tmp/ws/chats/policy.yaml',
       claudeBinary: 'claude',
       entrypointScript: '/opt/custom-entrypoint.sh',
       logger: nopLogger(),
@@ -699,6 +762,59 @@ describe('spawn-chat-shell.sh standalone leak closure (FIX-A B2)', () => {
     // Isolation guarantee unchanged: the credential is still gone.
     expect(childEnv).not.toContain('leaked-token-DO-NOT-PROPAGATE')
     expect(childEnv).not.toMatch(/^TELEGRAM_BOT_TOKEN=/m)
+  })
+
+  // The other half of the policy-path chain, and the half the round-12 test
+  // could not see. The pool puts TELEGRAM_MULTICHAT_POLICY_PATH in tmux's `-e`
+  // flags, but this wrapper runs BELOW that: `env -i` wipes everything and
+  // re-exports a fixed list. A variable missing from that list is silently
+  // dropped, and both hooks fall back to {WORKSPACE}/chats/policy.yaml — so on
+  // a deployment with a configured `policy_path` the server validates one file
+  // and the gate enforces another. Asserting tmux argv proves the pool's half
+  // and nothing about this one; this test reads the FINAL child env.
+  test('a configured policy path survives `env -i` and reaches the child', () => {
+    const result = spawnSync(SPAWN_WRAPPER, ['/usr/bin/env'], {
+      env: {
+        PATH: '/usr/local/bin:/usr/bin:/bin',
+        HOME: '/home/test',
+        CHAT_ID: '12345',
+        MULTICHAT_STATE_DIR: '/tmp/state',
+        CLAUDE_WORKSPACE_DIR: '/tmp/ws',
+        TELEGRAM_MULTICHAT_POLICY_PATH: '/etc/thrall/custom-policy.yaml',
+        // Sharing the TELEGRAM_ prefix with the bot token is not a licence to
+        // forward the token: the allowlist is by exact name, not by prefix.
+        TELEGRAM_BOT_TOKEN: 'leaked-token-DO-NOT-PROPAGATE',
+      },
+      encoding: 'utf8',
+    })
+
+    expect(result.status).toBe(0)
+    const childEnv = result.stdout
+    expect(childEnv).toMatch(
+      /^TELEGRAM_MULTICHAT_POLICY_PATH=\/etc\/thrall\/custom-policy\.yaml$/m,
+    )
+    expect(childEnv).not.toContain('leaked-token-DO-NOT-PROPAGATE')
+    expect(childEnv).not.toMatch(/^TELEGRAM_BOT_TOKEN=/m)
+  })
+
+  // An unset policy path must arrive EMPTY, not as the literal string the
+  // wrapper was handed. Both hooks use `${VAR:-default}`, which treats empty
+  // and unset alike, so an empty export is the correct no-op — but only if the
+  // wrapper does not invent a value.
+  test('an unset policy path is exported empty, so the hooks take their default', () => {
+    const result = spawnSync(SPAWN_WRAPPER, ['/usr/bin/env'], {
+      env: {
+        PATH: '/usr/local/bin:/usr/bin:/bin',
+        HOME: '/home/test',
+        CHAT_ID: '12345',
+        MULTICHAT_STATE_DIR: '/tmp/state',
+        CLAUDE_WORKSPACE_DIR: '/tmp/ws',
+      },
+      encoding: 'utf8',
+    })
+
+    expect(result.status).toBe(0)
+    expect(result.stdout).toMatch(/^TELEGRAM_MULTICHAT_POLICY_PATH=$/m)
   })
 
   test('wrapper exits non-zero if no CLAUDE_BIN argument given', () => {

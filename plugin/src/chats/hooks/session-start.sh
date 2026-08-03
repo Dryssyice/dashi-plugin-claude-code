@@ -39,11 +39,52 @@ if [[ -z "${CHAT_ID:-}" ]]; then
 fi
 
 WORKSPACE="${CLAUDE_WORKSPACE_DIR:-${HOME}/.claude-lab/thrall/.claude}"
-POLICY_PATH="${WORKSPACE}/chats/policy.yaml"
+# The second consumer of policy.yaml in this session, and it had the same
+# hard-coded default as the gate: with a configured `policy_path` the reminder
+# and persona context came from a file the server never loaded.
+POLICY_PATH="${TELEGRAM_MULTICHAT_POLICY_PATH:-${WORKSPACE}/chats/policy.yaml}"
 PERSONA_PATH="${WORKSPACE}/chats/${CHAT_ID}/persona.md"
 
-if ! command -v python3 >/dev/null 2>&1; then
-  echo "session-start: python3 not available, skipping injection" >&2
+# The gate learned to pick its interpreter by TESTING the import rather than
+# trusting PATH; this hook did not, and it is the second reader of the same
+# policy.yaml. `command -v python3` is happy with any python3 — including a
+# homebrew one with no PyYAML, which is what PATH resolves to on this machine.
+# The consequence was silent: `import yaml` failed inside the heredoc, the
+# except branch set `yaml = None`, and the session booted with the persona but
+# WITHOUT its per-chat system_reminder. Exit 0, stderr nobody reads, and the
+# operator's per-chat instructions simply never arrived.
+#
+# Same candidate order and the same `</dev/null` reasoning as pre-tool-use.sh;
+# see the long comment there. The two hooks must agree on which interpreter
+# reads the policy, or they disagree about what the policy SAYS.
+CHATS_HOOK_PYTHON_FALLBACKS="${CHATS_HOOK_PYTHON_FALLBACKS-/usr/bin/python3 /opt/homebrew/bin/python3 /usr/local/bin/python3}"
+
+POLICY_PYTHON=""
+set -f
+for candidate in \
+  "${CHATS_HOOK_PYTHON:-}" \
+  "$(command -v python3 2>/dev/null || true)" \
+  ${CHATS_HOOK_PYTHON_FALLBACKS}
+do
+  [[ -n "$candidate" ]] || continue
+  [[ -x "$candidate" ]] || continue
+  if "$candidate" -c 'import yaml' >/dev/null 2>&1 </dev/null; then
+    POLICY_PYTHON="$candidate"
+    break
+  fi
+done
+set +f
+
+# Unlike the gate, this hook must NOT deny — SessionStart degrades by design.
+# But a python3 with no PyYAML is still usable for the persona and for building
+# the JSON, so fall back to it rather than emitting nothing: losing the persona
+# too would turn a missing reminder into a missing identity.
+PERSONA_PYTHON="$POLICY_PYTHON"
+if [[ -z "$PERSONA_PYTHON" ]]; then
+  PERSONA_PYTHON="$(command -v python3 2>/dev/null || true)"
+fi
+if [[ -z "$PERSONA_PYTHON" ]]; then
+  echo "session-start: no usable python3 found, skipping injection" >&2
   exit 0
 fi
 
@@ -58,7 +99,7 @@ if [[ ! -f "$PERSONA_PATH" ]]; then
   echo "session-start: persona file not found at ${PERSONA_PATH} — emitting degraded-mode warning" >&2
   CHAT_ID="$CHAT_ID" \
   PERSONA_PATH="$PERSONA_PATH" \
-  python3 - <<'PYEOF'
+  "$PERSONA_PYTHON" - <<'PYEOF'
 import json
 import os
 
@@ -92,7 +133,8 @@ fi
 CHAT_ID="$CHAT_ID" \
 POLICY_PATH="$POLICY_PATH" \
 PERSONA_PATH="$PERSONA_PATH" \
-python3 - <<'PYEOF'
+POLICY_PYTHON_FOUND="$([[ -n "$POLICY_PYTHON" ]] && echo 1 || echo 0)" \
+"$PERSONA_PYTHON" - <<'PYEOF'
 import json
 import os
 import sys
@@ -126,6 +168,17 @@ if yaml is not None:
         print(f'session-start: policy parse failed: {e}', file=sys.stderr)
 
 parts = [persona.rstrip()]
+# A reminder that cannot be read must SAY so in the context the session sees.
+# Before this, a missing PyYAML dropped the per-chat instructions and reported
+# it only on stderr: the session looked normal and simply behaved as if the
+# operator had written nothing for this chat.
+if os.environ.get('POLICY_PYTHON_FOUND') != '1':
+    parts.append('---')
+    parts.append(
+        '⚠ Per-chat system_reminder НЕ ПРОЧИТАН: не нашёлся python3 с PyYAML. '
+        'Указания оператора для этого чата в контекст не попали — считай, что '
+        'ты их не видел, и скажи об этом, прежде чем действовать по умолчанию.'
+    )
 if reminder:
     parts.append('---')
     parts.append(reminder.strip())

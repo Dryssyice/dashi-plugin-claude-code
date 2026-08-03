@@ -225,6 +225,23 @@ export interface TmuxSessionPoolOptions {
   //
   // Defaults to `{workspaceDir}/chats` when omitted.
   chatsBasePath?: string
+  // The policy.yaml this server actually loaded, exported into every chat
+  // session as TELEGRAM_MULTICHAT_POLICY_PATH.
+  //
+  // Without it the PreToolUse gate falls back to `{workspaceDir}/chats/
+  // policy.yaml` while the server validated a different file — so on a
+  // deployment using `config.multichat.policy_path`, the two disagree about
+  // what the rules ARE. If the default file happens to exist and be weaker,
+  // that is not a lockout but a wrong allow.
+  //
+  // REQUIRED, and that is the point. It was optional with a default equal to
+  // the hook's, which made the two agree only for as long as two copies of one
+  // string kept matching — and made "caller forgot to pass the loaded path" a
+  // silent fallback instead of an error. No test could pin that seam either:
+  // delete the argument at the call site and every pool test stays green,
+  // because each one supplies its own value. Required moves the check to tsc,
+  // where forgetting it is a build failure rather than a test gap.
+  policyPath: string
   claudeBinary?: string
   // Optional wrapper script. When set, our spawn-chat-shell.sh wrapper
   // (which runs `env -i` and re-exports the allowlisted vars) execs
@@ -264,6 +281,7 @@ export class TmuxSessionPool {
   private readonly stateDir: string
   private readonly workspaceDir: string
   private readonly chatsBasePath: string
+  private readonly policyPath: string
   private readonly claudeBinary: string
   private readonly entrypointScript: string | undefined
   private readonly spawnWrapperPath: string
@@ -289,6 +307,21 @@ export class TmuxSessionPool {
     // hooks registration. Default mirrors the canonical Thrall layout
     // (`{workspace}/chats/.claude/settings.json`).
     this.chatsBasePath = opts.chatsBasePath ?? join(opts.workspaceDir, 'chats')
+    // No default: the only correct value is the file the server loaded, and a
+    // default here is a second place for it to be decided.
+    //
+    // Empty is rejected rather than accepted, because an empty string is the
+    // silent fallback re-entering through a door the type check does not
+    // cover: `policyPath: ''` compiles, emits `-e TELEGRAM_...=`, and both
+    // hooks use `${VAR:-default}`, which treats empty exactly like unset. The
+    // gate would then read the default file while the server read another one
+    // — the whole defect, restored, with no error anywhere.
+    if (opts.policyPath === '') {
+      throw new Error(
+        'TmuxSessionPool: policyPath must not be empty — pass the file the server loaded',
+      )
+    }
+    this.policyPath = opts.policyPath
     this.claudeBinary = opts.claudeBinary ?? 'claude'
     this.entrypointScript = opts.entrypointScript
     this.spawnWrapperPath = opts.spawnWrapperPath ?? DEFAULT_SPAWN_WRAPPER_PATH
@@ -733,6 +766,8 @@ export class TmuxSessionPool {
       `MULTICHAT_STATE_DIR=${this.stateDir}`,
       '-e',
       `CLAUDE_WORKSPACE_DIR=${this.workspaceDir}`,
+      '-e',
+      `TELEGRAM_MULTICHAT_POLICY_PATH=${this.policyPath}`,
     ]
     // Opus MED-B #22 (2026-05-27): sort childEnv entries by key before
     // emitting `-e KEY=VAL` pairs. `Object.entries` order is
