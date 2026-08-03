@@ -731,6 +731,59 @@ describe('spawn-chat-shell.sh standalone leak closure (FIX-A B2)', () => {
     expect(childEnv).not.toMatch(/^TELEGRAM_BOT_TOKEN=/m)
   })
 
+  // The other half of the policy-path chain, and the half the round-12 test
+  // could not see. The pool puts TELEGRAM_MULTICHAT_POLICY_PATH in tmux's `-e`
+  // flags, but this wrapper runs BELOW that: `env -i` wipes everything and
+  // re-exports a fixed list. A variable missing from that list is silently
+  // dropped, and both hooks fall back to {WORKSPACE}/chats/policy.yaml — so on
+  // a deployment with a configured `policy_path` the server validates one file
+  // and the gate enforces another. Asserting tmux argv proves the pool's half
+  // and nothing about this one; this test reads the FINAL child env.
+  test('a configured policy path survives `env -i` and reaches the child', () => {
+    const result = spawnSync(SPAWN_WRAPPER, ['/usr/bin/env'], {
+      env: {
+        PATH: '/usr/local/bin:/usr/bin:/bin',
+        HOME: '/home/test',
+        CHAT_ID: '12345',
+        MULTICHAT_STATE_DIR: '/tmp/state',
+        CLAUDE_WORKSPACE_DIR: '/tmp/ws',
+        TELEGRAM_MULTICHAT_POLICY_PATH: '/etc/thrall/custom-policy.yaml',
+        // Sharing the TELEGRAM_ prefix with the bot token is not a licence to
+        // forward the token: the allowlist is by exact name, not by prefix.
+        TELEGRAM_BOT_TOKEN: 'leaked-token-DO-NOT-PROPAGATE',
+      },
+      encoding: 'utf8',
+    })
+
+    expect(result.status).toBe(0)
+    const childEnv = result.stdout
+    expect(childEnv).toMatch(
+      /^TELEGRAM_MULTICHAT_POLICY_PATH=\/etc\/thrall\/custom-policy\.yaml$/m,
+    )
+    expect(childEnv).not.toContain('leaked-token-DO-NOT-PROPAGATE')
+    expect(childEnv).not.toMatch(/^TELEGRAM_BOT_TOKEN=/m)
+  })
+
+  // An unset policy path must arrive EMPTY, not as the literal string the
+  // wrapper was handed. Both hooks use `${VAR:-default}`, which treats empty
+  // and unset alike, so an empty export is the correct no-op — but only if the
+  // wrapper does not invent a value.
+  test('an unset policy path is exported empty, so the hooks take their default', () => {
+    const result = spawnSync(SPAWN_WRAPPER, ['/usr/bin/env'], {
+      env: {
+        PATH: '/usr/local/bin:/usr/bin:/bin',
+        HOME: '/home/test',
+        CHAT_ID: '12345',
+        MULTICHAT_STATE_DIR: '/tmp/state',
+        CLAUDE_WORKSPACE_DIR: '/tmp/ws',
+      },
+      encoding: 'utf8',
+    })
+
+    expect(result.status).toBe(0)
+    expect(result.stdout).toMatch(/^TELEGRAM_MULTICHAT_POLICY_PATH=$/m)
+  })
+
   test('wrapper exits non-zero if no CLAUDE_BIN argument given', () => {
     const result = spawnSync(SPAWN_WRAPPER, [], {
       env: { PATH: '/usr/bin:/bin' },

@@ -49,6 +49,23 @@ shift
 # Optional (hook bookkeeping, set when policy-loader / persona pipeline
 # wants them; absent in MVP):
 #   POLICY_PATH, PERSONA_PATH
+# Policy location (set on EVERY spawn by the pool, default or configured):
+#   TELEGRAM_MULTICHAT_POLICY_PATH
+#
+# On TELEGRAM_MULTICHAT_POLICY_PATH: do not read POLICY_PATH above as this
+# one under another name. POLICY_PATH is legacy bookkeeping nothing sets;
+# TELEGRAM_MULTICHAT_POLICY_PATH is the file the SERVER validated, and both
+# pre-tool-use.sh and session-start.sh read it. Dropping it here does not
+# fail closed — the hooks fall back to {WORKSPACE}/chats/policy.yaml, so a
+# deployment with a configured `policy_path` gets its gate enforcing a
+# different file than the one the server checked, which on a weaker default
+# is a wrong ALLOW.
+#
+# It shares the TELEGRAM_ prefix with the bot token, so state the rule the
+# allowlist actually follows: forwarding is by EXACT NAME, never by prefix.
+# The value is a filesystem path, not a credential; the token is still wiped
+# (asserted in tmux-session-pool.env.test.ts against this wrapper's real
+# child env, not against tmux argv, which sits above the wipe).
 #
 # FIX (2026-05-28): forward TMUX and TMUX_PANE through the env -i wipe.
 # tmux sets these on the new-session command's environment (verified:
@@ -94,4 +111,5 @@ exec env -i \
   XDG_CACHE_HOME="${XDG_CACHE_HOME:-}" \
   POLICY_PATH="${POLICY_PATH:-}" \
   PERSONA_PATH="${PERSONA_PATH:-}" \
+  TELEGRAM_MULTICHAT_POLICY_PATH="${TELEGRAM_MULTICHAT_POLICY_PATH:-}" \
   "$CLAUDE_BIN" "$@"
