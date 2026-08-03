@@ -18,7 +18,7 @@
 
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { spawnSync } from 'child_process'
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'fs'
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 
@@ -957,16 +957,27 @@ describe('pre-tool-use.sh — a block says which kind of block it is', () => {
     expect(JSON.parse(r.stdout).reason).toContain('chat entry #2')
   })
 
-  // The one field an injected prompt actually writes. A Bash call whose
-  // `command` is not a string was skipped in silence and reached «default
-  // allow» — the same asymmetry this file closes everywhere else.
-  const MALFORMED_COMMANDS: ReadonlyArray<readonly [string, unknown]> = [
-    ['a list', ['rm', '-rf', '/tmp/x']],
-    ['a number', 42],
-    ['an object', { cmd: 'ls' }],
+  // The one field an injected prompt actually writes, in the two shapes this
+  // hook got wrong in opposite directions.
+  //
+  // A non-string `command` was skipped in silence. A MISSING or empty one was
+  // turned into `''`, which matches no pattern and reaches «Default allow» —
+  // codex found the second on the round that fixed the first, and it is the
+  // same defect `extractCommand` in permission-policy.ts already carries a
+  // comment about: «the old code returned '' here and an empty command
+  // auto-allowed». Two implementations of one gate, and the shell copy was a
+  // round behind the TypeScript one.
+  const MALFORMED_COMMANDS: ReadonlyArray<readonly [string, Record<string, unknown>]> = [
+    ['a list', { command: ['rm', '-rf', '/tmp/x'] }],
+    ['a number', { command: 42 }],
+    ['an object', { command: { cmd: 'ls' } }],
+    ['missing entirely', {}],
+    ['an empty string', { command: '' }],
+    ['nothing but whitespace', { command: '   \t\n' }],
+    ['null', { command: null }],
   ]
 
-  for (const [label, command] of MALFORMED_COMMANDS) {
+  for (const [label, toolInput] of MALFORMED_COMMANDS) {
     test(`a Bash call whose command is ${label} denies`, () => {
       writeFileSync(policyPath, POLICY_WITH_RULES, 'utf8')
       const r = run(
@@ -976,20 +987,121 @@ describe('pre-tool-use.sh — a block says which kind of block it is', () => {
           CLAUDE_WORKSPACE_DIR: workspace,
           CHAT_ID: '164795011',
         },
-        JSON.stringify({ tool_name: 'Bash', tool_input: { command } }),
+        JSON.stringify({ tool_name: 'Bash', tool_input: toolInput }),
       )
       expect(`${label}: ${r.code}`).toBe(`${label}: 2`)
       const payload = JSON.parse(r.stdout)
       expect(`${label}: ${payload.denied_by}`).toBe(`${label}: hook-failure`)
-      // Deleting the check does NOT open the gate — `command.lower()` raises one
-      // line later and the crash trap denies. It does make the refusal say
-      // «AttributeError» instead of naming the field, and it makes the guard
-      // depend on an accident of the next statement rather than on a decision.
-      expect(`${label}: ${payload.reason.includes('command is not a string')}`).toBe(
+      // Deleting the type half of the check does NOT open the gate —
+      // `command.strip()` raises one line later and the crash trap denies. It
+      // does make the refusal say «AttributeError» instead of naming the field,
+      // and it makes the guard depend on an accident of the next statement.
+      // Deleting the empty half opens it outright, and silently.
+      expect(`${label}: ${payload.reason.includes('command is missing, empty')}`).toBe(
         `${label}: true`,
       )
     })
   }
+
+  // codex round 8, MUST. `deney:` is `bash_patern:` one level up, and it is
+  // worse: a misspelt deny KEY leaves the chat with no rules at all rather than
+  // one rule short. The loader's `.strict()` throws on the same file, so before
+  // this check the gate applied a policy the server would have refused to load.
+  const STRAY_ENTRY_KEYS: ReadonlyArray<readonly [string, string]> = [
+    ['the deny block itself misspelt', '    deney:\n      bash_patterns:\n        - "rm"\n'],
+    ['a field the schema has never had', '    allow_everything: true\n'],
+    ['a plural that reads right', '    denies:\n      bash_patterns:\n        - "rm"\n'],
+  ]
+
+  for (const [label, tail] of STRAY_ENTRY_KEYS) {
+    test(`an unknown key in a chat entry is refused: ${label}`, () => {
+      writeFileSync(policyPath, `version: 1\nchats:\n  "164795011":\n${tail}`, 'utf8')
+      const r = run(
+        PRE_HOOK,
+        {
+          MULTICHAT_STATE_DIR: workspace,
+          CLAUDE_WORKSPACE_DIR: workspace,
+          CHAT_ID: '164795011',
+        },
+        JSON.stringify({ tool_name: 'Bash', tool_input: { command: 'rm -rf /' } }),
+      )
+      expect(`${label}: ${r.code}`).toBe(`${label}: 2`)
+      const payload = JSON.parse(r.stdout)
+      expect(`${label}: ${payload.denied_by}`).toBe(`${label}: hook-failure`)
+      expect(`${label}: ${payload.reason.includes('unknown keys')}`).toBe(`${label}: true`)
+    })
+  }
+
+  // …and the other direction, which is the whole reason the check is on NAMES
+  // and not on values: every field the schema does allow must pass. PyYAML
+  // reads YAML 1.1, so `streaming: off` arrives here as the boolean False while
+  // the loader (js-yaml, JSON_SCHEMA) sees the string "off". A hook that
+  // validated that value against the enum would deny every tool call in every
+  // chat over a legal, documented file.
+  test('a chat entry with the full documented shape is accepted, values and all', () => {
+    writeFileSync(
+      policyPath,
+      [
+        'version: 1',
+        'allowlist:',
+        '  chats: ["164795011"]',
+        '  users: ["abramov_aicreator"]',
+        'mention_allowlist: ["abramov_aicreator"]',
+        'chats:',
+        '  "164795011":',
+        '    mode: private',
+        '    streaming: off',
+        '    tmux_mirror: no',
+        '    edit_message_progress: yes',
+        '    delivery: final_only',
+        '    persona_file: persona.md',
+        '    handoff_file: handoff.md',
+        '    system_reminder: ""',
+        '    idle_ttl_ms: 1800000',
+        '    max_queue_depth: 1',
+        '    deny:',
+        '      bash_patterns:',
+        '        - "rm -rf /"',
+        '',
+      ].join('\n'),
+      'utf8',
+    )
+    const env = {
+      MULTICHAT_STATE_DIR: workspace,
+      CLAUDE_WORKSPACE_DIR: workspace,
+      CHAT_ID: '164795011',
+    }
+    const allowed = run(
+      PRE_HOOK,
+      env,
+      JSON.stringify({ tool_name: 'Bash', tool_input: { command: 'ls -la' } }),
+    )
+    expect(`allowed: ${allowed.code}`).toBe('allowed: 0')
+
+    // …and the rules in that same file still bite.
+    const denied = run(
+      PRE_HOOK,
+      env,
+      JSON.stringify({ tool_name: 'Bash', tool_input: { command: 'sudo rm -rf / now' } }),
+    )
+    expect(`denied: ${denied.code}`).toBe('denied: 2')
+    expect(JSON.parse(denied.stdout).denied_by).toBe('policy')
+  })
+
+  // The pin that makes the check above safe to keep. The hook's CHAT_KEYS is a
+  // hand-copy of ChatPolicySchema; a field added to the schema and not to the
+  // hook would make the hook refuse every call in every chat, live, with a
+  // correct file on disk. That failure belongs in CI, not in the operator's
+  // evening — so the two lists are compared directly, in the same repo.
+  test('the hook’s chat-entry key list matches ChatPolicySchema exactly', async () => {
+    const { ChatPolicySchema } = await import('../../src/chats/policy-loader')
+    const fromSchema = Object.keys(ChatPolicySchema.shape).sort()
+    const hookSource = readFileSync(PRE_HOOK, 'utf8')
+    const block = hookSource.match(/CHAT_KEYS = \(([\s\S]*?)\)/)
+    expect(block).not.toBeNull()
+    const fromHook = [...(block?.[1] ?? '').matchAll(/'([a-z_]+)'/g)].map((m) => m[1]).sort()
+    expect(fromHook).toEqual(fromSchema)
+  })
 
   // The 1-based position is the ONLY navigation the operator gets, because the
   // rule text is deliberately never printed. An off-by-one sends them to edit

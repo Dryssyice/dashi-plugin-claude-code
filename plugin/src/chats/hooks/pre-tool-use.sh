@@ -214,6 +214,24 @@ except Exception:  # noqa: BLE001
 
 DENY_KEYS = ('mcp_tools', 'read_paths', 'bash_patterns')
 
+# Every key name `ChatPolicySchema` allows in a chat entry, and nothing else.
+# A name outside this set is refused; whether a name inside it is PRESENT is the
+# loader's business, not this hook's. See validated_deny() for both halves of
+# that reasoning.
+CHAT_KEYS = (
+    'mode',
+    'streaming',
+    'tmux_mirror',
+    'edit_message_progress',
+    'delivery',
+    'persona_file',
+    'handoff_file',
+    'system_reminder',
+    'deny',
+    'idle_ttl_ms',
+    'max_queue_depth',
+)
+
 
 def validated_deny(raw_policy: object, wanted_chat: str) -> dict:
     """Return this chat's deny lists, or refuse the call outright.
@@ -295,11 +313,27 @@ def validated_deny(raw_policy: object, wanted_chat: str) -> dict:
     # if the two disagree, the session comes up under a policy the gate reads
     # differently from the server that loaded it.
     #
-    # The deny block only, and deliberately: the rest of a chat entry (mode,
-    # persona_file, ttl…) is the loader's schema, it is enforced at load time
-    # before any session exists, and restating it here would be the same schema
-    # in two languages drifting apart. What this hook enforces is what this hook
-    # acts on.
+    # Chat entries are checked by KEY NAME — required names present, unknown
+    # names refused — and never by value.
+    #
+    # The names matter because `deney:` is a fail-open of exactly the shape this
+    # function exists to remove, one level up from the `bash_patern:` typo
+    # already caught inside the deny block: the rules read like rules in the
+    # file, `deny` is absent, this chat gets no restrictions, and the loader's
+    # `.strict()` would have thrown on the same file. A typo must not be the
+    # difference between a gate and no gate.
+    #
+    # The VALUES are deliberately not checked, and this is a decision with a
+    # reason rather than an omission. PyYAML reads YAML 1.1, js-yaml reads
+    # JSON_SCHEMA: the documented `streaming: off` arrives here as the boolean
+    # `False` and in the loader as the string `"off"`. A hook that validated
+    # that value against the schema's enum would refuse a policy the server
+    # accepts — turning every tool call in every chat into a denial over a
+    # legal, documented file. Names do not coerce; values do.
+    #
+    # Drift between the two lists is caught by a test that reads the schema's
+    # own keys (`hooks-sentinel.test.ts`), so a field added to
+    # `ChatPolicySchema` reddens CI here rather than locking every live chat.
     #
     # The cost is real and belongs in the open: one malformed entry anywhere
     # locks every chat until the file is fixed. That is the same direction the
@@ -327,6 +361,20 @@ def validated_deny(raw_policy: object, wanted_chat: str) -> dict:
         if not isinstance(value, dict):
             problems.append(f'{where}: entry is not a mapping')
             continue
+
+        # An unknown key name in the entry. `deney: {...}` is the whole reason:
+        # it reads like a rule block, leaves `deny` absent, and hands the chat no
+        # restrictions at all — the `bash_patern:` fail-open one level up, in a
+        # file the loader's `.strict()` would have thrown on.
+        #
+        # Presence of the schema's OWN names is deliberately not checked. A file
+        # missing `persona_file` is rejected by the loader before any session
+        # exists, and this hook reads none of those fields; refusing over them
+        # would be a NEW way for the gate to lock a working system, bought with
+        # no gate safety at all.
+        stray = sorted({str(k) for k in value} - set(CHAT_KEYS))
+        if stray:
+            problems.append(f'{where}: unknown keys: ' + ', '.join(stray))
 
         # An ABSENT `deny` is legitimate -- no rules for this chat has always
         # meant no denials. A `deny:` written with no value is not the same
@@ -443,17 +491,22 @@ for field in PATH_FIELDS:
 
 # 3) bash_patterns — substring by default, fnmatch when meta present.
 if tool_name == 'Bash':
+    # A Bash call MUST carry a non-empty string command; everything else is
+    # malformed and denies. This is `extractCommand` in permission-policy.ts
+    # written out in the other language, down to the reason it exists there:
+    # «the old code returned '' here and an empty command auto-allowed».
+    #
+    # This hook had both halves of that bug. A non-string `command` was skipped
+    # in silence — `{"command": ["rm", "-rf", "/"]}` and `{"command": 42}` both
+    # ran — and a MISSING or empty one was turned into `''`, which matches no
+    # pattern and reaches «Default allow». Under bypassPermissions there is no
+    # native prompt behind this hook to catch either.
     command = tool_input.get('command')
-    if command is None:
-        command = ''
-    # A Bash call whose `command` is not a string used to be skipped in silence
-    # and reach «Default allow» — `{"command": ["rm", "-rf", "/"]}` and
-    # `{"command": 42}` both ran. That is the same asymmetry this file closes
-    # for `tool_call`, `tool_name` and `tool_input`, left standing on the ONE
-    # field whose contents an injected prompt actually writes. The neighbouring
-    # gate spells the rule out: a command it cannot extract must fail CLOSED.
-    if not isinstance(command, str):
-        emit_block('Bash: command is not a string (fail-safe deny)', 'hook-failure')
+    if not isinstance(command, str) or not command.strip():
+        emit_block(
+            'Bash: command is missing, empty or not a string (fail-safe deny)',
+            'hook-failure',
+        )
 
     cmd_lower = command.lower()
     for i, pattern in enumerate(bash_patterns):
