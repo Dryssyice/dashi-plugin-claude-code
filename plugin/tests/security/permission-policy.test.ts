@@ -93,41 +93,131 @@ describe('secret files by kind, not by name (live read of agent.env 2026-07-29)'
     expect(v.tier).toBe('deny')
     expect(v.matchedRule).toContain('builtin:deny_path')
   })
-  test('reading channel.env is denied', () => {
-    const v = classify('Read', { file_path: '/home/x/lab/kuznets/secrets/channel.env' }, VARIANT1)
+  // The fixture is deliberately OUTSIDE `secrets/`. Inside it, the case passed
+  // on the pre-existing `**/secrets/**` rule and stayed green with the new
+  // pattern deleted -- a test that agreed with the defect. `matchedRule` is
+  // asserted for the same reason: `tier` alone cannot say WHICH rule fired.
+  test('reading channel.env outside secrets/ is denied', () => {
+    const v = classify('Read', { file_path: '/home/x/lab/kuznets/.claude/channel.env' }, VARIANT1)
     expect(v.tier).toBe('deny')
+    expect(v.matchedRule).toContain('builtin:deny_path')
   })
-  test('a file whose name says token is denied', () => {
-    const v = classify('Read', { file_path: '/home/x/app/access_token.json' }, VARIANT1)
+  test('WRITING agent.env is denied too, not only reading', () => {
+    const v = classify('Write', { file_path: '/home/x/lab/marketer/.claude/agent.env' }, VARIANT1)
     expect(v.tier).toBe('deny')
+    expect(v.matchedRule).toContain('builtin:deny_path')
   })
   test('.netrc is denied', () => {
     const v = classify('Read', { file_path: '/home/x/.netrc' }, VARIANT1)
     expect(v.tier).toBe('deny')
+    expect(v.matchedRule).toContain('builtin:deny_path')
+  })
+  test('.npmrc is denied', () => {
+    const v = classify('Read', { file_path: '/home/x/.npmrc' }, VARIANT1)
+    expect(v.tier).toBe('deny')
+    expect(v.matchedRule).toContain('builtin:deny_path')
+  })
+  test('.envrc is denied', () => {
+    const v = classify('Read', { file_path: '/home/x/proj/.envrc' }, VARIANT1)
+    expect(v.tier).toBe('deny')
+    expect(v.matchedRule).toContain('builtin:deny_path')
+  })
+  test('a bearer file is denied — the 2026-07-29 incident by name', () => {
+    const v = classify('Read', { file_path: '/home/x/creds/gateway-bearer.json' }, VARIANT1)
+    expect(v.tier).toBe('deny')
+    expect(v.matchedRule).toContain('builtin:deny_path')
   })
   test('cat agent.env in bash is denied too', () => {
     const v = classify('Bash', { command: 'cat /home/x/lab/marketer/.claude/agent.env' }, VARIANT1)
     expect(v.tier).toBe('deny')
     expect(v.matchedRule).toContain('builtin:deny_bash')
   })
-  test('a bash reference to a token FILE is denied', () => {
-    const v = classify('Bash', { command: 'cat ~/creds/access_token.json' }, VARIANT1)
+
+  // The Read/Write list and the Bash list are two tables that drift apart
+  // silently. `.netrc` and `.npmrc` were denied on Read and open on `cat` --
+  // the surface that gets used the most.
+  test('cat .netrc in bash is denied', () => {
+    const v = classify('Bash', { command: 'cat /home/x/.netrc' }, VARIANT1)
     expect(v.tier).toBe('deny')
+    expect(v.matchedRule).toContain('builtin:deny_bash')
+  })
+  test('cat .npmrc in bash is denied', () => {
+    const v = classify('Bash', { command: 'cat /home/x/.npmrc' }, VARIANT1)
+    expect(v.tier).toBe('deny')
+    expect(v.matchedRule).toContain('builtin:deny_bash')
+  })
+  test('cat .envrc in bash is denied', () => {
+    const v = classify('Bash', { command: 'cat /home/x/proj/.envrc' }, VARIANT1)
+    expect(v.tier).toBe('deny')
+    expect(v.matchedRule).toContain('builtin:deny_bash')
+  })
+  test('cat a bearer file in bash is denied', () => {
+    const v = classify('Bash', { command: 'cat /home/x/creds/gateway-bearer.json' }, VARIANT1)
+    expect(v.tier).toBe('deny')
+    expect(v.matchedRule).toContain('builtin:deny_bash')
   })
 
-  // The other half. Each of these was checked against the real regex, not
-  // assumed: the word «token» in ordinary work, and env-shaped names that are
-  // not env files.
-  test('grepping for the WORD token in source is not denied', () => {
-    const v = classify('Bash', { command: 'grep -rn token src/parser.ts' }, VARIANT1)
-    expect(v.tier).not.toBe('deny')
-  })
+  // The other half. Each of these was measured against the real classifier,
+  // not assumed. A gate that blocks ordinary work gets worked around, and this
+  // one sits ABOVE operator policy: nothing in a config can switch it off, so
+  // a false positive here is a release, not a setting.
   test('an env var named NODE_ENV is not denied', () => {
     const v = classify('Bash', { command: 'NODE_ENV=production bun run build' }, VARIANT1)
     expect(v.tier).not.toBe('deny')
   })
   test('a source file about environments is not denied', () => {
     const v = classify('Read', { file_path: '/home/x/app/src/environment.ts' }, VARIANT1)
+    expect(v.tier).not.toBe('deny')
+  })
+
+  // `process.env` is a property access, not a file, and it ends in `.env`
+  // after a filename character exactly like `agent.env` does. It appears 246
+  // times in 6 files of this plugin alone; denying it would have made routine
+  // maintenance impossible from the moment of the release.
+  test('grepping for process.env is not denied', () => {
+    const v = classify('Bash', { command: 'grep -rn process.env src/' }, VARIANT1)
+    expect(v.tier).not.toBe('deny')
+  })
+  test('node -e reading process.env is not denied', () => {
+    const v = classify('Bash', { command: 'node -e "console.log(process.env.HOME)"' }, VARIANT1)
+    expect(v.tier).not.toBe('deny')
+  })
+  test('import.meta.env is not denied', () => {
+    const v = classify('Bash', { command: 'rg "import.meta.env" plugin/src' }, VARIANT1)
+    expect(v.tier).not.toBe('deny')
+  })
+  // Stripping the property access must not become a way to smuggle the file
+  // past the gate in the same command.
+  test('a command naming BOTH process.env and a real env file is still denied', () => {
+    const v = classify('Bash', { command: 'grep process.env /home/x/.claude/agent.env' }, VARIANT1)
+    expect(v.tier).toBe('deny')
+    expect(v.matchedRule).toContain('builtin:deny_bash')
+  })
+
+  // `*token*` is deliberately absent from the deny list. The class «name
+  // contains token» does not separate from ordinary source by name, and both
+  // reviewers reproduced the same regression on this exact pattern. These
+  // cases pin the removal: if someone widens the glob again, they go red and
+  // say why. Credential files named «token» need a different signal — its own
+  // task, not a wider glob.
+  test('a source file named tokenizer.ts is NOT denied', () => {
+    const v = classify('Read', { file_path: '/home/x/app/src/tokenizer.ts' }, VARIANT1)
+    expect(v.tier).not.toBe('deny')
+  })
+  test('creating src/token.ts is NOT denied', () => {
+    const v = classify('Write', { file_path: '/home/x/app/src/token.ts' }, VARIANT1)
+    expect(v.tier).not.toBe('deny')
+  })
+  test('design tokens are NOT denied', () => {
+    const v = classify('Read', { file_path: '/home/x/app/tailwind/design-tokens.json' }, VARIANT1)
+    expect(v.tier).not.toBe('deny')
+  })
+  test('running the auth token test file is NOT denied', () => {
+    const v = classify('Bash', { command: 'bun test tests/auth/token.test.ts' }, VARIANT1)
+    expect(v.tier).not.toBe('deny')
+  })
+  test('grepping for the WORD token in source is not denied', () => {
+    const v = classify('Bash', { command: 'grep -rn token src/parser.ts' }, VARIANT1)
     expect(v.tier).not.toBe('deny')
   })
   test('prose mentioning a token is not denied', () => {

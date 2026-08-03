@@ -198,8 +198,21 @@ const BUILTIN_DENY_PATHS: readonly string[] = [
   // than on what the file is. On 2026-07-29 a live bearer token was read out
   // of `agent.env` with nothing objecting.
   '**/*.env',
-  // Likewise by kind, not by name: anything whose name says «token».
-  '**/*token*',
+  // `*token*` was here and is deliberately NOT: the class «name contains
+  // token» cannot be told apart from ordinary source by name alone. Both
+  // reviewers reproduced the same regression -- `src/tokenizer.ts`,
+  // `tests/auth/token.test.ts`, `tailwind/design-tokens.json` all became a
+  // hard-deny on Read AND on Write, so an agent could no longer even create
+  // `src/token.ts`. A gate that blocks ordinary work gets worked around, and
+  // this one sits above operator policy, so nobody could switch it off.
+  // Credential files whose name says «token» need a different signal than the
+  // name; that is its own task, not a wider glob here.
+  //
+  // `*bearer*` by extension, straight from the operator's rules: the 2026-07-29
+  // incident was a bearer token, and the rule listing it predates this file.
+  '**/*bearer*.txt',
+  '**/*bearer*.json',
+  '**/*bearer*.key',
   '**/*.pem',
   '**/*.key',
   '**/.netrc',
@@ -271,13 +284,25 @@ const SECRET_BASH_RES: readonly RegExp[] = [
   // environment file whether or not it starts with a dot. The preceding
   // character must be part of a filename, so `NODE_ENV` and prose about «the
   // env» stay out.
+  //
+  // What that boundary does NOT keep out is a property access: `process.env`
+  // and `import.meta.env` end in `.env` preceded by a filename character too.
+  // Measured before this line was fixed: `grep -rn process.env src/`,
+  // `rg "process.env" plugin/src` and `node -e "…process.env.HOME"` were all
+  // hard-denied on the branch and allowed on main, and this deny sits above
+  // operator policy -- unswitchable without a release. `process.env` appears
+  // 246 times in 6 files of this very plugin. So those two forms are removed
+  // from the command before the file patterns look at it: see
+  // `stripEnvPropertyAccess`.
   /[a-z0-9_-]\.env\b/i,
-  // «token» only when it looks like a path or a filename -- preceded by a
-  // separator, or carrying an extension. The bare English word must NOT match:
-  // `grep token src/parser.ts` is ordinary work, and a gate that blocks
-  // ordinary work gets worked around, which is worse than a narrower gate.
-  /(\/|[._-])[a-z0-9_-]*token|token[a-z0-9_-]*(\.[a-z0-9]+|\/)/i,
   /\.envrc\b/i,
+  // `.netrc` and `.npmrc` were denied on Read/Write only. `cat ~/.netrc` --
+  // login and password in plain text -- went through, on the surface that is
+  // used the most. A list that looks closed and is open on half its doors is
+  // worse than a short one.
+  /\.netrc\b/i,
+  /\.npmrc\b/i,
+  /bearer[a-z0-9_-]*\.(txt|json|key)\b/i,
   /\.pem\b/i,
   /\.key\b/i,
   /(^|[\s'"=:(/<>|&;])\.?secrets?\//i,
@@ -420,9 +445,23 @@ function builtinBashHardDeny(command: string): string | null {
   return null
 }
 
+/** `process.env` / `import.meta.env` are property accesses, not files.
+ *
+ *  They end in `.env` after a filename character, so the file patterns below
+ *  match them exactly as they match `agent.env`. Removing the two literal
+ *  forms first is narrower than loosening the file pattern: the pattern keeps
+ *  catching `agent.env`, and a command that mentions BOTH -- say
+ *  `grep process.env agent.env` -- still hard-denies on what is left. */
+const ENV_PROPERTY_ACCESS_RE = /\b(?:process|import\s*\.\s*meta)\s*\.\s*env\b/gi
+
+function stripEnvPropertyAccess(command: string): string {
+  return command.replace(ENV_PROPERTY_ACCESS_RE, ' ')
+}
+
 /** Built-in secret-path hard-deny over a Bash command. */
 function bashReferencesSecret(command: string): boolean {
-  return SECRET_BASH_RES.some((re) => re.test(command))
+  const scanned = stripEnvPropertyAccess(command)
+  return SECRET_BASH_RES.some((re) => re.test(scanned))
 }
 
 /** Interpreter/exfil pipe evasion that must reach the owner as a confirm.
