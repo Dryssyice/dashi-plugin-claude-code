@@ -233,7 +233,15 @@ export interface TmuxSessionPoolOptions {
   // deployment using `config.multichat.policy_path`, the two disagree about
   // what the rules ARE. If the default file happens to exist and be weaker,
   // that is not a lockout but a wrong allow.
-  policyPath?: string
+  //
+  // REQUIRED, and that is the point. It was optional with a default equal to
+  // the hook's, which made the two agree only for as long as two copies of one
+  // string kept matching — and made "caller forgot to pass the loaded path" a
+  // silent fallback instead of an error. No test could pin that seam either:
+  // delete the argument at the call site and every pool test stays green,
+  // because each one supplies its own value. Required moves the check to tsc,
+  // where forgetting it is a build failure rather than a test gap.
+  policyPath: string
   claudeBinary?: string
   // Optional wrapper script. When set, our spawn-chat-shell.sh wrapper
   // (which runs `env -i` and re-exports the allowlisted vars) execs
@@ -301,7 +309,9 @@ export class TmuxSessionPool {
     this.chatsBasePath = opts.chatsBasePath ?? join(opts.workspaceDir, 'chats')
     // Same default the hook falls back to, so the two agree when nothing is
     // configured and agree explicitly when something is.
-    this.policyPath = opts.policyPath ?? join(opts.workspaceDir, 'chats', 'policy.yaml')
+    // No default: the only correct value is the file the server loaded, and a
+    // default here is a second place for it to be decided.
+    this.policyPath = opts.policyPath
     this.claudeBinary = opts.claudeBinary ?? 'claude'
     this.entrypointScript = opts.entrypointScript
     this.spawnWrapperPath = opts.spawnWrapperPath ?? DEFAULT_SPAWN_WRAPPER_PATH

@@ -169,6 +169,7 @@ describe('FIX-E M1 — getOrSpawn duplicate-spawn race', () => {
       stateDir,
       workspaceDir: join(tmpDir, 'ws'),
       chatsBasePath: join(tmpDir, 'ws', 'chats'),
+      policyPath: join(tmpDir, 'ws', 'chats', 'policy.yaml'),
       claudeBinary: 'claude',
       logger,
     })
@@ -365,6 +366,7 @@ describe('FIX-E M2 — kill() preserves dead-letter + mismatched', () => {
       stateDir,
       workspaceDir: join(tmpDir, 'ws'),
       chatsBasePath: join(tmpDir, 'ws', 'chats'),
+      policyPath: join(tmpDir, 'ws', 'chats', 'policy.yaml'),
       claudeBinary: 'claude',
       logger,
     })
@@ -421,6 +423,7 @@ describe('FIX-E M2 — kill() preserves dead-letter + mismatched', () => {
       stateDir,
       workspaceDir: join(tmpDir, 'ws'),
       chatsBasePath: join(tmpDir, 'ws', 'chats'),
+      policyPath: join(tmpDir, 'ws', 'chats', 'policy.yaml'),
       claudeBinary: 'claude',
       logger,
     })
@@ -447,6 +450,7 @@ describe('FIX-E M2 — kill() preserves dead-letter + mismatched', () => {
       stateDir,
       workspaceDir: join(tmpDir, 'ws'),
       chatsBasePath: join(tmpDir, 'ws', 'chats'),
+      policyPath: join(tmpDir, 'ws', 'chats', 'policy.yaml'),
       claudeBinary: 'claude',
       logger,
     })

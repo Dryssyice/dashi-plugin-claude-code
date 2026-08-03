@@ -63,7 +63,11 @@ import {
   handleHudCallback,
   type HudTelegramApi,
 } from './status/context-hud.js'
-import { loadPolicyFromPath, type MultichatPolicy } from './chats/policy-loader.js'
+import {
+  defaultMultichatPolicyPath,
+  loadPolicyFromPath,
+  type MultichatPolicy,
+} from './chats/policy-loader.js'
 import { MultichatRouter } from './router/multichat-router.js'
 import { TmuxSessionPool } from './router/tmux-session-pool.js'
 import { InboundWatcher } from './telegram/watcher.js'
@@ -363,7 +367,7 @@ if (config.multichat.enabled) {
       ? configuredPolicyPath
       : resolvePath(multichatWorkspaceDir, configuredPolicyPath)
   } else {
-    multichatPolicyPath = join(multichatWorkspaceDir, 'chats', 'policy.yaml')
+    multichatPolicyPath = defaultMultichatPolicyPath(multichatWorkspaceDir)
   }
   multichatStateDir =
     config.multichat.state_dir
@@ -1166,6 +1170,11 @@ if (
   multichatPolicy !== undefined
   && multichatStateDir !== undefined
   && multichatWorkspaceDir !== undefined
+  // The loaded path joins the other three in the guard because the pool now
+  // requires it. All four are assigned together when multichat is enabled, so
+  // this cannot degrade a working deployment; what it rules out is booting the
+  // pool without the path and letting the gate silently read another file.
+  && multichatPolicyPath !== undefined
 ) {
   try {
     // chatsBasePath: claude's cwd. The workspace-level
@@ -1212,7 +1221,7 @@ if (
       // Resolved above from config.multichat.policy_path /
       // TELEGRAM_MULTICHAT_POLICY_PATH; passing it on is what makes the hook's
       // env override reachable in practice rather than only in a test.
-      ...(multichatPolicyPath ? { policyPath: multichatPolicyPath } : {}),
+      policyPath: multichatPolicyPath,
       ...(entrypointExists ? { entrypointScript } : {}),
     })
     multichatRouter = new MultichatRouter({

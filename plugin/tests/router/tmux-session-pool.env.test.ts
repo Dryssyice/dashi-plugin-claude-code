@@ -402,6 +402,7 @@ describe('TmuxSessionPool end-to-end env sanitization', () => {
       stateDir: fixture.stateDir,
       workspaceDir: '/tmp/ws',
       chatsBasePath: '/tmp/ws/chats',
+      policyPath: '/tmp/ws/chats/policy.yaml',
       claudeBinary: 'claude',
       logger: nopLogger(),
     })
@@ -440,6 +441,7 @@ describe('TmuxSessionPool end-to-end env sanitization', () => {
       stateDir: fixture.stateDir,
       workspaceDir: '/tmp/ws',
       chatsBasePath: '/tmp/ws/chats',
+      policyPath: '/tmp/ws/chats/policy.yaml',
       claudeBinary: 'claude',
       logger: nopLogger(),
     })
@@ -474,6 +476,7 @@ describe('TmuxSessionPool end-to-end env sanitization', () => {
       stateDir: fixture.stateDir,
       workspaceDir: '/tmp/ws',
       chatsBasePath: '/tmp/ws/chats',
+      policyPath: '/tmp/ws/chats/policy.yaml',
       claudeBinary: 'claude',
       logger: nopLogger(),
     })
@@ -484,9 +487,11 @@ describe('TmuxSessionPool end-to-end env sanitization', () => {
     expect(argv).toContain('CHAT_ID=-100')
     expect(argv).toContain(`MULTICHAT_STATE_DIR=${fixture.stateDir}`)
     expect(argv).toContain('CLAUDE_WORKSPACE_DIR=/tmp/ws')
-    // With nothing configured the session is told the same default the
-    // PreToolUse gate would have fallen back to anyway — stated rather than
-    // left to two copies of the same string agreeing by luck.
+    // The pool forwards the path it was GIVEN. It no longer has a default to
+    // fall back to — `policyPath` is required, so there is exactly one place
+    // the value is decided (server.ts) instead of two that have to keep
+    // agreeing. That the decided default matches the hooks' own fallback is
+    // pinned in server.boot.test.ts, against the hook scripts themselves.
     expect(argv).toContain('TELEGRAM_MULTICHAT_POLICY_PATH=/tmp/ws/chats/policy.yaml')
   })
 
@@ -527,6 +532,7 @@ describe('TmuxSessionPool end-to-end env sanitization', () => {
       stateDir: fixture.stateDir,
       workspaceDir: '/tmp/ws',
       chatsBasePath: '/tmp/ws/chats',
+      policyPath: '/tmp/ws/chats/policy.yaml',
       claudeBinary: 'claude',
       logger: nopLogger(),
     })
@@ -553,6 +559,7 @@ describe('TmuxSessionPool end-to-end env sanitization', () => {
       stateDir: fixture.stateDir,
       workspaceDir: '/tmp/ws',
       chatsBasePath: '/tmp/ws/chats',
+      policyPath: '/tmp/ws/chats/policy.yaml',
       claudeBinary: 'claude',
       logger: nopLogger(),
     })
@@ -588,6 +595,7 @@ describe('TmuxSessionPool end-to-end env sanitization', () => {
       stateDir: fixture.stateDir,
       workspaceDir: '/tmp/ws',
       chatsBasePath: '/tmp/ws/chats',
+      policyPath: '/tmp/ws/chats/policy.yaml',
       claudeBinary: 'claude',
       logger: nopLogger(),
     })
@@ -616,6 +624,7 @@ describe('TmuxSessionPool end-to-end env sanitization', () => {
       stateDir: fixture.stateDir,
       workspaceDir: '/tmp/ws',
       chatsBasePath: '/tmp/ws/chats',
+      policyPath: '/tmp/ws/chats/policy.yaml',
       claudeBinary: 'claude',
       entrypointScript: '/opt/custom-entrypoint.sh',
       logger: nopLogger(),
