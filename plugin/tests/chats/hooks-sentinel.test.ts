@@ -763,6 +763,56 @@ describe('pre-tool-use.sh — a block says which kind of block it is', () => {
     })
   }
 
+  // codex round 5: an invalid file was applied as an EMPTY policy whenever the
+  // calling chat had no entry of its own — the complaint was collected and the
+  // function returned before reporting it. Fail-open reintroduced by the order
+  // of two statements, in the function written to remove fail-open.
+  test('an invalid file denies even when this chat has no entry at all', () => {
+    writeFileSync(
+      policyPath,
+      'version: 2\nchats:\n  "999":\n    deny:\n      bash_patterns:\n        - "rm"\n',
+      'utf8',
+    )
+    const r = run(
+      PRE_HOOK,
+      {
+        MULTICHAT_STATE_DIR: workspace,
+        CLAUDE_WORKSPACE_DIR: workspace,
+        CHAT_ID: '164795011',
+      },
+      JSON.stringify({ tool_name: 'Bash', tool_input: { command: 'ls' } }),
+    )
+    expect(r.code).toBe(2)
+    expect(JSON.parse(r.stdout).denied_by).toBe('hook-failure')
+  })
+
+  // …and the whole file is validated, not only the calling chat's corner of it.
+  // The TypeScript loader is strict over every chat, so a file it would reject
+  // must not be a file this hook accepts — otherwise the session comes up under
+  // a policy the gate reads differently from the server that loaded it. The
+  // cost is stated rather than hidden: one malformed entry anywhere locks every
+  // chat until the file is fixed.
+  test("another chat's broken entry denies this chat too", () => {
+    writeFileSync(
+      policyPath,
+      'version: 1\nchats:\n  "164795011":\n    deny:\n      bash_patterns:\n        - "rm"\n  "999":\n    deny:\n      read_paths: "not-a-list"\n',
+      'utf8',
+    )
+    const r = run(
+      PRE_HOOK,
+      {
+        MULTICHAT_STATE_DIR: workspace,
+        CLAUDE_WORKSPACE_DIR: workspace,
+        CHAT_ID: '164795011',
+      },
+      JSON.stringify({ tool_name: 'Bash', tool_input: { command: 'ls' } }),
+    )
+    expect(r.code).toBe(2)
+    const payload = JSON.parse(r.stdout)
+    expect(payload.denied_by).toBe('hook-failure')
+    expect(payload.reason).toContain('chat 999')
+  })
+
   // Every complaint at once. Naming only the first costs the operator one
   // round of editing per mistake, in a file where every mistake locks the chat.
   test('a policy with several mistakes names all of them', () => {
@@ -818,6 +868,11 @@ describe('pre-tool-use.sh — a block says which kind of block it is', () => {
     ['the call is a list', '[]'],
     ['the call is a string', '"Bash"'],
     ['tool_name is not a string', '{"tool_name": 42, "tool_input": {}}'],
+    // The shape that says least about itself was the one that got through:
+    // `.get(…, '')` turned a missing name into a usable one, and a call with no
+    // name matches no rule.
+    ['tool_name is missing', '{"tool_input": {}}'],
+    ['tool_name is empty', '{"tool_name": "", "tool_input": {}}'],
     ['tool_input is a string', '{"tool_name": "Bash", "tool_input": "ls"}'],
     ['tool_input is a list', '{"tool_name": "Bash", "tool_input": []}'],
   ]

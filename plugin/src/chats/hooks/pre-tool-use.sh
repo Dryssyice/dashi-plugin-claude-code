@@ -258,44 +258,57 @@ def validated_deny(raw_policy: object, wanted_chat: str) -> dict:
     if not isinstance(chats_map, dict):
         emit_block('policy.yaml chats is not a mapping (fail-safe deny)', 'hook-failure')
 
-    # Keys compared as TEXT on both sides: an unquoted chat id is an int here
-    # and a string in the loader that validated the same file.
-    entry = None
+    # ONE exit, and that is the point rather than a style choice: the first
+    # version returned early when this chat had no entry, and `version: 2` --
+    # already collected as a problem -- was never reported. An invalid file was
+    # applied as an empty policy, which is the fail-open this function exists to
+    # remove, reintroduced by the order of two statements.
+    lists: dict = {name: [] for name in DENY_KEYS}
+
+    # EVERY chat is validated, not just the one calling. The TypeScript loader
+    # is strict over the whole file, so a file it would reject must not be a
+    # file this hook accepts -- if the two disagree, the session comes up under
+    # a policy the gate reads differently from the server that loaded it.
+    #
+    # The cost is real and belongs in the open: one malformed entry anywhere
+    # locks every chat until the file is fixed. That is the same direction the
+    # rest of this hook already chose, and a session running under a policy
+    # nobody can parse is the thing being avoided.
     for key, value in chats_map.items():
-        if str(key) == wanted_chat:
-            entry = value
-            break
-
-    # No entry for this chat has always meant no denials, and still does.
-    if entry is None:
-        return {name: [] for name in DENY_KEYS}
-    if not isinstance(entry, dict):
-        emit_block('the chat entry is not a mapping (fail-safe deny)', 'hook-failure')
-
-    deny_map = entry.get('deny')
-    if deny_map is None:
-        deny_map = {}
-    if not isinstance(deny_map, dict):
-        emit_block('the deny block is not a mapping (fail-safe deny)', 'hook-failure')
-
-    unknown = sorted(str(k) for k in deny_map if str(k) not in DENY_KEYS)
-    if unknown:
-        problems.append('unknown deny keys: ' + ', '.join(unknown))
-
-    lists: dict = {}
-    for name in DENY_KEYS:
-        value = deny_map.get(name)
+        where = f'chat {key}'
         if value is None:
-            lists[name] = []
             continue
-        if not isinstance(value, list):
-            problems.append(f'{name} is not a list')
-            lists[name] = []
+        if not isinstance(value, dict):
+            problems.append(f'{where}: entry is not a mapping')
             continue
-        bad = [str(i + 1) for i, item in enumerate(value) if not isinstance(item, str)]
-        if bad:
-            problems.append(f'{name} has non-string rules at #' + ', #'.join(bad))
-        lists[name] = value
+
+        deny_map = value.get('deny')
+        if deny_map is None:
+            deny_map = {}
+        if not isinstance(deny_map, dict):
+            problems.append(f'{where}: deny is not a mapping')
+            continue
+
+        unknown = sorted(str(k) for k in deny_map if str(k) not in DENY_KEYS)
+        if unknown:
+            problems.append(f'{where}: unknown deny keys: ' + ', '.join(unknown))
+
+        # Keys compared as TEXT on both sides: an unquoted chat id is an int
+        # here and a string in the loader that validated the same file.
+        mine = str(key) == wanted_chat
+
+        for name in DENY_KEYS:
+            rules = deny_map.get(name)
+            if rules is None:
+                continue
+            if not isinstance(rules, list):
+                problems.append(f'{where}: {name} is not a list')
+                continue
+            bad = [str(i + 1) for i, item in enumerate(rules) if not isinstance(item, str)]
+            if bad:
+                problems.append(f'{where}: {name} has non-string rules at #' + ', #'.join(bad))
+            if mine:
+                lists[name] = rules
 
     if problems:
         emit_block(
@@ -318,8 +331,12 @@ bash_patterns = deny_lists['bash_patterns']
 if not isinstance(tool_call, dict):
     emit_block('the tool call is not an object (fail-safe deny)', 'hook-failure')
 
-raw_tool = tool_call.get('tool_name', '')
-if not isinstance(raw_tool, str):
+# Absent and empty are refusals too, not just «not a string». `.get(…, '')`
+# turned a missing name into a usable one, and a call with no name matches no
+# rule -- so the shape that says least about itself was the shape that got
+# through. Every real PreToolUse payload carries a tool name.
+raw_tool = tool_call.get('tool_name')
+if not isinstance(raw_tool, str) or not raw_tool:
     emit_block('the tool call has no usable tool_name (fail-safe deny)', 'hook-failure')
 tool_name = raw_tool
 
