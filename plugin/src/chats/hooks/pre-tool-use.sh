@@ -248,15 +248,40 @@ def validated_deny(raw_policy: object, wanted_chat: str) -> dict:
     if not isinstance(policy_map, dict):
         emit_block('policy.yaml root is not a mapping (fail-safe deny)', 'hook-failure')
 
-    version = policy_map.get('version')
-    if version is not None and version != 1:
+    # `version` and `chats` are REQUIRED, and their absence is a refusal rather
+    # than a default.
+    #
+    # This was the largest fail-open left in the file and it hid behind looking
+    # like tidiness: `{}` was a policy with no rules, `version: 1` with no
+    # `chats:` was a policy with no rules, and a `chats` block that did not
+    # mention the calling chat was a policy with no rules. Three ways to say
+    # «allow everything», none of them logged anywhere.
+    #
+    # The loader answers the same question the opposite way -- `policy-loader.ts`
+    # says in as many words that a null policy is to be treated as DENY, with no
+    # fallback to defaults and no implicit allow -- and the server reads the file
+    # ONCE at startup while this hook re-reads it on every call. So overwriting
+    # policy.yaml a single time silently removed every deny rule from every live
+    # session, and nothing anywhere recorded it.
+    #
+    # A running session is proof its chat was in the file when the session
+    # started. If it is not there now, the file changed underneath, and that is
+    # the moment to stop rather than the moment to assume the best.
+    if 'version' not in policy_map:
+        problems.append('version is missing')
+    elif policy_map.get('version') != 1:
         problems.append('version is not 1')
+
+    if 'chats' not in policy_map:
+        problems.append('the chats block is missing')
 
     chats_map = policy_map.get('chats')
     if chats_map is None:
         chats_map = {}
     if not isinstance(chats_map, dict):
         emit_block('policy.yaml chats is not a mapping (fail-safe deny)', 'hook-failure')
+    elif not any(str(key) == wanted_chat for key in chats_map):
+        problems.append('this chat has no entry in policy.yaml')
 
     # ONE exit, and that is the point rather than a style choice: the first
     # version returned early when this chat had no entry, and `version: 2` --
@@ -280,8 +305,17 @@ def validated_deny(raw_policy: object, wanted_chat: str) -> dict:
     # locks every chat until the file is fixed. That is the same direction the
     # rest of this hook already chose, and a session running under a policy
     # nobody can parse is the thing being avoided.
-    for key, value in chats_map.items():
-        where = f'chat {key}'
+    for index, (key, value) in enumerate(chats_map.items()):
+        # The calling chat is named; every other chat is a POSITION.
+        #
+        # `chat {key}` for all of them meant a session could be told
+        # «chat -100…: read_paths is not a list» about a completely different
+        # conversation of the operator's — and a session in a public group can
+        # repeat the reason it was blocked with into that group. The docstring
+        # above promises no values out of policy.yaml; another chat's id is one
+        # in every sense that matters.
+        mine = str(key) == wanted_chat
+        where = f'chat {key}' if mine else f'chat entry #{index + 1}'
         # `chats:\n  "999":` -- a key with nothing after it -- is `None` here,
         # and skipping it was the same fail-open one shape smaller: a crooked
         # record anywhere in the file went unmentioned while the rule claimed
@@ -310,10 +344,9 @@ def validated_deny(raw_policy: object, wanted_chat: str) -> dict:
         if unknown:
             problems.append(f'{where}: unknown deny keys: ' + ', '.join(unknown))
 
-        # Keys compared as TEXT on both sides: an unquoted chat id is an int
-        # here and a string in the loader that validated the same file.
-        mine = str(key) == wanted_chat
-
+        # `mine` was decided above, comparing keys as TEXT on both sides: an
+        # unquoted chat id is an int here and a string in the loader that
+        # validated the same file.
         for name in DENY_KEYS:
             rules = deny_map.get(name)
             if rules is None:
@@ -373,8 +406,12 @@ def rule_ref(section: str, index: int) -> str:
 
 
 # 1) mcp_tools / tool-name deny — fnmatch globs.
+#
+# No isinstance guard on the pattern in any of the three loops below: a
+# non-string rule is refused by validated_deny before we get here, and a guard
+# that cannot fire reads as «this can happen» to the next person.
 for i, pattern in enumerate(mcp_tools):
-    if isinstance(pattern, str) and fnmatch.fnmatch(tool_name, pattern):
+    if fnmatch.fnmatch(tool_name, pattern):
         emit_block(rule_ref('mcp_tools', i))
 
 # 2) read_paths — wherever the call names a path.
@@ -387,9 +424,14 @@ for i, pattern in enumerate(mcp_tools):
 # nobody left to ask.
 #
 # The same mistake as the shape checks above, one layer down: the rule was made
-# to depend on WHICH tool arrived rather than on what the call is doing. A deny
-# list of paths applies wherever a path appears, and a tool added next month
-# gets it for free instead of getting an exemption for free.
+# to depend on WHICH tool arrived rather than on what the call is doing.
+#
+# The scope is these three STRING fields and no more, which is narrower than it
+# sounds and is stated here rather than implied. A path travelling as a LIST is
+# not covered -- `reply(files: [...])` in this same plugin attaches a file to a
+# Telegram message and would walk past every one of these. Naming it beats an
+# earlier version of this comment, which claimed the class was closed and would
+# have stopped the next reader from looking.
 PATH_FIELDS = ('file_path', 'notebook_path', 'path')
 for field in PATH_FIELDS:
     candidate = tool_input.get(field)
@@ -401,20 +443,28 @@ for field in PATH_FIELDS:
 
 # 3) bash_patterns — substring by default, fnmatch when meta present.
 if tool_name == 'Bash':
-    command = tool_input.get('command') or ''
-    if isinstance(command, str):
-        cmd_lower = command.lower()
-        for i, pattern in enumerate(bash_patterns):
-            if not isinstance(pattern, str):
-                continue
-            pat_lower = pattern.lower()
-            has_meta = any(ch in pat_lower for ch in '*?[')
-            if has_meta:
-                if fnmatch.fnmatch(cmd_lower, pat_lower):
-                    emit_block(rule_ref('bash_patterns', i))
-            else:
-                if pat_lower in cmd_lower:
-                    emit_block(rule_ref('bash_patterns', i))
+    command = tool_input.get('command')
+    if command is None:
+        command = ''
+    # A Bash call whose `command` is not a string used to be skipped in silence
+    # and reach «Default allow» — `{"command": ["rm", "-rf", "/"]}` and
+    # `{"command": 42}` both ran. That is the same asymmetry this file closes
+    # for `tool_call`, `tool_name` and `tool_input`, left standing on the ONE
+    # field whose contents an injected prompt actually writes. The neighbouring
+    # gate spells the rule out: a command it cannot extract must fail CLOSED.
+    if not isinstance(command, str):
+        emit_block('Bash: command is not a string (fail-safe deny)', 'hook-failure')
+
+    cmd_lower = command.lower()
+    for i, pattern in enumerate(bash_patterns):
+        pat_lower = pattern.lower()
+        has_meta = any(ch in pat_lower for ch in '*?[')
+        if has_meta:
+            if fnmatch.fnmatch(cmd_lower, pat_lower):
+                emit_block(rule_ref('bash_patterns', i))
+        else:
+            if pat_lower in cmd_lower:
+                emit_block(rule_ref('bash_patterns', i))
 
 # Default allow.
 sys.exit(0)

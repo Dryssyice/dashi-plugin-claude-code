@@ -731,22 +731,33 @@ describe('pre-tool-use.sh — a block says which kind of block it is', () => {
     expect(JSON.parse(r.stdout).denied_by).toBe('policy')
   })
 
-  const QUIET: ReadonlyArray<readonly [string, string]> = [
+  // Each case names the phrase the refusal must carry. That third column is not
+  // decoration: exit code plus `denied_by` are identical for EVERY deny in this
+  // file, including the one the crash trap produces, so a suite that checks only
+  // those two cannot tell a check that fired from a check that was deleted. Five
+  // mutants proved it — remove the explicit guard and the AttributeError one
+  // line later delivers the same 2 and the same `hook-failure`. The reason is
+  // the only observable that differs, and it is also the only thing the operator
+  // gets to navigate by.
+  const QUIET: ReadonlyArray<readonly [string, string, string]> = [
     [
       'a typo in a deny key — reads like a rule, is not one',
       'version: 1\nchats:\n  "164795011":\n    deny:\n      bash_patern:\n        - "rm"\n',
+      'unknown deny keys',
     ],
     [
       'non-string rules inside a valid list — [on, 007] is [True, 7] after YAML',
       'version: 1\nchats:\n  "164795011":\n    deny:\n      bash_patterns:\n        - on\n        - 007\n',
+      'has non-string rules at #1, #2',
     ],
     [
       'a version this hook does not know',
       'version: 2\nchats:\n  "164795011":\n    deny:\n      bash_patterns:\n        - "rm"\n',
+      'version is not 1',
     ],
   ]
 
-  for (const [label, yaml] of QUIET) {
+  for (const [label, yaml, phrase] of QUIET) {
     test(`a policy that would silently stop denying is refused: ${label}`, () => {
       writeFileSync(policyPath, yaml, 'utf8')
       const r = run(
@@ -759,7 +770,9 @@ describe('pre-tool-use.sh — a block says which kind of block it is', () => {
         JSON.stringify({ tool_name: 'Bash', tool_input: { command: 'ls' } }),
       )
       expect(`${label}: ${r.code}`).toBe(`${label}: 2`)
-      expect(`${label}: ${JSON.parse(r.stdout).denied_by}`).toBe(`${label}: hook-failure`)
+      const payload = JSON.parse(r.stdout)
+      expect(`${label}: ${payload.denied_by}`).toBe(`${label}: hook-failure`)
+      expect(`${label}: ${payload.reason.includes(phrase)}`).toBe(`${label}: true`)
     })
   }
 
@@ -819,9 +832,196 @@ describe('pre-tool-use.sh — a block says which kind of block it is', () => {
       expect(`${label}: ${r.code}`).toBe(`${label}: 2`)
       const payload = JSON.parse(r.stdout)
       expect(`${label}: ${payload.denied_by}`).toBe(`${label}: hook-failure`)
-      expect(`${label}: ${payload.reason.includes('chat 999')}`).toBe(`${label}: true`)
+      // The operator still gets a place to look — the 1-based position of the
+      // entry, second in this file — but the other chat's id stays out of a
+      // session that may be sitting in a public group and may repeat its
+      // refusal there.
+      expect(`${label}: ${payload.reason.includes('chat entry #2')}`).toBe(`${label}: true`)
+      expect(`${label}: ${payload.reason.includes('999')}`).toBe(`${label}: false`)
     })
   }
+
+  // Opus review, final round. The three shapes in which the STRICT pass
+  // allowed everything — the largest fail-open left in the file, and it hid
+  // behind looking like tidiness. The loader answers the same question the
+  // opposite way (a null policy is to be treated as DENY, in as many words),
+  // and the server reads the file once at startup while this hook re-reads it
+  // per call: overwriting policy.yaml a single time silently removed every deny
+  // rule from every live session, logged nowhere.
+  const SILENTLY_EMPTY: ReadonlyArray<readonly [string, string, string]> = [
+    ['an empty file', '{}\n', 'version is missing'],
+    ['a version with no chats block', 'version: 1\n', 'the chats block is missing'],
+    [
+      'a chats block with no chats in it',
+      'version: 1\nchats: {}\n',
+      'this chat has no entry in policy.yaml',
+    ],
+    [
+      'a file that does not mention this chat',
+      'version: 1\nchats:\n  "999":\n    deny:\n      bash_patterns:\n        - "rm"\n',
+      'this chat has no entry in policy.yaml',
+    ],
+    [
+      'no version at all',
+      'chats:\n  "164795011":\n    deny:\n      bash_patterns:\n        - "rm"\n',
+      'version is missing',
+    ],
+  ]
+
+  for (const [label, yaml, phrase] of SILENTLY_EMPTY) {
+    test(`a policy that would allow everything is refused: ${label}`, () => {
+      writeFileSync(policyPath, yaml, 'utf8')
+      const r = run(
+        PRE_HOOK,
+        {
+          MULTICHAT_STATE_DIR: workspace,
+          CLAUDE_WORKSPACE_DIR: workspace,
+          CHAT_ID: '164795011',
+        },
+        JSON.stringify({ tool_name: 'Bash', tool_input: { command: 'ls' } }),
+      )
+      expect(`${label}: ${r.code}`).toBe(`${label}: 2`)
+      const payload = JSON.parse(r.stdout)
+      expect(`${label}: ${payload.denied_by}`).toBe(`${label}: hook-failure`)
+      // Without this line, deleting the `version`/`chats` presence checks leaves
+      // the suite green: the NEXT check denies the same file for a different
+      // reason, and the operator is sent to the wrong line.
+      expect(`${label}: ${payload.reason.includes(phrase)}`).toBe(`${label}: true`)
+    })
+  }
+
+  // A chat gets ITS OWN rules and not the neighbour's. Nothing tested this:
+  // deleting the `if mine:` that scopes the assignment left the whole suite
+  // green, and under that mutation one chat executes another chat's deny list —
+  // extra refusals, plus another chat's configuration leaking into behaviour.
+  // Every two-chat fixture until now had the second chat either broken (so the
+  // refusal came first) or without a deny block at all.
+  test("a chat executes its own deny list, not the neighbour's", () => {
+    writeFileSync(
+      policyPath,
+      [
+        'version: 1',
+        'chats:',
+        '  "164795011":',
+        '    deny:',
+        '      bash_patterns:',
+        '        - "mine-only"',
+        '  "999":',
+        '    deny:',
+        '      bash_patterns:',
+        '        - "theirs-only"',
+        '',
+      ].join('\n'),
+      'utf8',
+    )
+    const env = {
+      MULTICHAT_STATE_DIR: workspace,
+      CLAUDE_WORKSPACE_DIR: workspace,
+      CHAT_ID: '164795011',
+    }
+    const theirs = run(
+      PRE_HOOK,
+      env,
+      JSON.stringify({ tool_name: 'Bash', tool_input: { command: 'theirs-only now' } }),
+    )
+    expect(`neighbour's rule: ${theirs.code}`).toBe(`neighbour's rule: 0`)
+
+    const ours = run(
+      PRE_HOOK,
+      env,
+      JSON.stringify({ tool_name: 'Bash', tool_input: { command: 'mine-only now' } }),
+    )
+    expect(`own rule: ${ours.code}`).toBe(`own rule: 2`)
+  })
+
+  // Another chat's id must not travel into this session's refusal: a session in
+  // a public group can repeat the reason it was blocked with into that group.
+  test("a refusal about another chat names a position, not that chat's id", () => {
+    writeFileSync(
+      policyPath,
+      'version: 1\nchats:\n  "164795011":\n    deny: {}\n  "-1003784643974":\n    deny:\n      read_paths: "not-a-list"\n',
+      'utf8',
+    )
+    const r = run(
+      PRE_HOOK,
+      {
+        MULTICHAT_STATE_DIR: workspace,
+        CLAUDE_WORKSPACE_DIR: workspace,
+        CHAT_ID: '164795011',
+      },
+      JSON.stringify({ tool_name: 'Bash', tool_input: { command: 'ls' } }),
+    )
+    expect(r.code).toBe(2)
+    expect(r.stdout).not.toContain('1003784643974')
+    expect(r.stderr).not.toContain('1003784643974')
+    expect(JSON.parse(r.stdout).reason).toContain('chat entry #2')
+  })
+
+  // The one field an injected prompt actually writes. A Bash call whose
+  // `command` is not a string was skipped in silence and reached «default
+  // allow» — the same asymmetry this file closes everywhere else.
+  const MALFORMED_COMMANDS: ReadonlyArray<readonly [string, unknown]> = [
+    ['a list', ['rm', '-rf', '/tmp/x']],
+    ['a number', 42],
+    ['an object', { cmd: 'ls' }],
+  ]
+
+  for (const [label, command] of MALFORMED_COMMANDS) {
+    test(`a Bash call whose command is ${label} denies`, () => {
+      writeFileSync(policyPath, POLICY_WITH_RULES, 'utf8')
+      const r = run(
+        PRE_HOOK,
+        {
+          MULTICHAT_STATE_DIR: workspace,
+          CLAUDE_WORKSPACE_DIR: workspace,
+          CHAT_ID: '164795011',
+        },
+        JSON.stringify({ tool_name: 'Bash', tool_input: { command } }),
+      )
+      expect(`${label}: ${r.code}`).toBe(`${label}: 2`)
+      const payload = JSON.parse(r.stdout)
+      expect(`${label}: ${payload.denied_by}`).toBe(`${label}: hook-failure`)
+      // Deleting the check does NOT open the gate — `command.lower()` raises one
+      // line later and the crash trap denies. It does make the refusal say
+      // «AttributeError» instead of naming the field, and it makes the guard
+      // depend on an accident of the next statement rather than on a decision.
+      expect(`${label}: ${payload.reason.includes('command is not a string')}`).toBe(
+        `${label}: true`,
+      )
+    })
+  }
+
+  // The 1-based position is the ONLY navigation the operator gets, because the
+  // rule text is deliberately never printed. An off-by-one sends them to edit
+  // the wrong line, and until now no assertion looked at the number.
+  test('the rule position points at the rule that fired', () => {
+    writeFileSync(
+      policyPath,
+      [
+        'version: 1',
+        'chats:',
+        '  "164795011":',
+        '    deny:',
+        '      bash_patterns:',
+        '        - "first-rule"',
+        '        - "second-rule"',
+        '        - "third-rule"',
+        '',
+      ].join('\n'),
+      'utf8',
+    )
+    const r = run(
+      PRE_HOOK,
+      {
+        MULTICHAT_STATE_DIR: workspace,
+        CLAUDE_WORKSPACE_DIR: workspace,
+        CHAT_ID: '164795011',
+      },
+      JSON.stringify({ tool_name: 'Bash', tool_input: { command: 'run second-rule now' } }),
+    )
+    expect(r.code).toBe(2)
+    expect(JSON.parse(r.stdout).reason).toBe('bash_patterns deny: rule #2 in policy.yaml')
+  })
 
   // …and an entry that simply has no deny block is NOT a mistake. No rules for
   // a chat has always meant no denials, and a guard that cannot tell «absent»
@@ -895,20 +1095,31 @@ describe('pre-tool-use.sh — a block says which kind of block it is', () => {
   // The tool call is the half an injected prompt actually controls. Unreadable
   // JSON already denied; readable JSON of the wrong shape fell through to
   // defaults and was allowed — the same asymmetry, on the more exposed side.
-  const MALFORMED_CALLS: ReadonlyArray<readonly [string, string]> = [
-    ['the call is a list', '[]'],
-    ['the call is a string', '"Bash"'],
-    ['tool_name is not a string', '{"tool_name": 42, "tool_input": {}}'],
+  // Third column again: which part of the call the refusal names. Substituting
+  // `tool_call = {}` for the refusal keeps the verdict — the missing tool_name
+  // is caught one line down — so only the text tells the two apart.
+  const MALFORMED_CALLS: ReadonlyArray<readonly [string, string, string]> = [
+    ['the call is a list', '[]', 'the tool call is not an object'],
+    ['the call is a string', '"Bash"', 'the tool call is not an object'],
+    ['tool_name is not a string', '{"tool_name": 42, "tool_input": {}}', 'no usable tool_name'],
     // The shape that says least about itself was the one that got through:
     // `.get(…, '')` turned a missing name into a usable one, and a call with no
     // name matches no rule.
-    ['tool_name is missing', '{"tool_input": {}}'],
-    ['tool_name is empty', '{"tool_name": "", "tool_input": {}}'],
-    ['tool_input is a string', '{"tool_name": "Bash", "tool_input": "ls"}'],
-    ['tool_input is a list', '{"tool_name": "Bash", "tool_input": []}'],
+    ['tool_name is missing', '{"tool_input": {}}', 'no usable tool_name'],
+    ['tool_name is empty', '{"tool_name": "", "tool_input": {}}', 'no usable tool_name'],
+    [
+      'tool_input is a string',
+      '{"tool_name": "Bash", "tool_input": "ls"}',
+      'tool_input is not an object',
+    ],
+    [
+      'tool_input is a list',
+      '{"tool_name": "Bash", "tool_input": []}',
+      'tool_input is not an object',
+    ],
   ]
 
-  for (const [label, body] of MALFORMED_CALLS) {
+  for (const [label, body, phrase] of MALFORMED_CALLS) {
     test(`a tool call of the wrong shape denies: ${label}`, () => {
       writeFileSync(policyPath, POLICY_WITH_RULES, 'utf8')
       const r = run(
@@ -921,7 +1132,9 @@ describe('pre-tool-use.sh — a block says which kind of block it is', () => {
         body,
       )
       expect(`${label}: ${r.code}`).toBe(`${label}: 2`)
-      expect(`${label}: ${JSON.parse(r.stdout).denied_by}`).toBe(`${label}: hook-failure`)
+      const payload = JSON.parse(r.stdout)
+      expect(`${label}: ${payload.denied_by}`).toBe(`${label}: hook-failure`)
+      expect(`${label}: ${payload.reason.includes(phrase)}`).toBe(`${label}: true`)
     })
   }
 })
