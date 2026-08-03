@@ -56,6 +56,38 @@ function run(
   }
 }
 
+// The fields `ChatPolicySchema` requires, as the YAML lines that sit under a
+// chat id. Every fixture that is meant to be a LEGITIMATE entry is built from
+// this rather than hand-written.
+//
+// codex found the reason twice: the suite used to drive the hook with miniature
+// policies the real loader would have thrown on, so it could prove neither
+// direction — that a legal live file is accepted, nor that an illegal one is
+// refused. Values are deliberately spelled the way the README spells them,
+// including the YAML 1.1 traps (`off`, `no`, `yes`), because that is what is on
+// disk on the operator's machine.
+const REQUIRED_FIELDS = [
+  '    mode: private',
+  '    streaming: progress',
+  '    tmux_mirror: false',
+  '    edit_message_progress: false',
+  '    delivery: final_only',
+  '    persona_file: persona.md',
+  '    handoff_file: handoff.md',
+  '    system_reminder: ""',
+].join('\n')
+
+/** One complete chat entry: the required fields plus whatever the test adds. */
+function entry(id: string, extra = ''): string {
+  const tail = extra ? `${extra.replace(/\n+$/, '')}\n` : ''
+  return `  "${id}":\n${REQUIRED_FIELDS}\n${tail}`
+}
+
+/** A whole policy.yaml around one or more entries. */
+function policyOf(...entries: string[]): string {
+  return `version: 1\nchats:\n${entries.join('')}`
+}
+
 let workspace: string
 let policyPath: string
 
@@ -68,17 +100,18 @@ beforeEach(() => {
   // no path/MCP denies. Lets us assert allow vs deny on Bash calls.
   writeFileSync(
     policyPath,
-    [
-      'version: 1',
-      'chats:',
-      '  "164795011":',
-      '    deny:',
-      '      bash_patterns:',
-      '        - "rm -rf /"',
-      '      mcp_tools: []',
-      '      read_paths: []',
-      '',
-    ].join('\n'),
+    policyOf(
+      entry(
+        '164795011',
+        [
+          '    deny:',
+          '      bash_patterns:',
+          '        - "rm -rf /"',
+          '      mcp_tools: []',
+          '      read_paths: []',
+        ].join('\n'),
+      ),
+    ),
     'utf8',
   )
 })
@@ -593,15 +626,12 @@ describe('pre-tool-use.sh — a block says which kind of block it is', () => {
   test('a policy deny names the rule, never the rule text', () => {
     writeFileSync(
       policyPath,
-      [
-        'version: 1',
-        'chats:',
-        '  "164795011":',
-        '    deny:',
-        '      bash_patterns:',
-        '        - "sekrit-path-fragment"',
-        '',
-      ].join('\n'),
+      policyOf(
+        entry(
+          '164795011',
+          ['    deny:', '      bash_patterns:', '        - "sekrit-path-fragment"'].join('\n'),
+        ),
+      ),
       'utf8',
     )
     const r = run(
@@ -623,17 +653,18 @@ describe('pre-tool-use.sh — a block says which kind of block it is', () => {
   // MATCHES anything. Turning off the `read_paths` and `mcp_tools` comparisons
   // outright left the suite green — two deny lists the tests had never seen
   // work. A rule nothing exercises is a rule nobody will notice losing.
-  const POLICY_WITH_RULES = [
-    'version: 1',
-    'chats:',
-    '  "164795011":',
-    '    deny:',
-    '      mcp_tools:',
-    '        - "mcp__forbidden*"',
-    '      read_paths:',
-    '        - "/protected/*"',
-    '',
-  ].join('\n')
+  const POLICY_WITH_RULES = policyOf(
+    entry(
+      '164795011',
+      [
+        '    deny:',
+        '      mcp_tools:',
+        '        - "mcp__forbidden*"',
+        '      read_paths:',
+        '        - "/protected/*"',
+      ].join('\n'),
+    ),
+  )
 
   const POSITIVE_DENIES: ReadonlyArray<readonly [string, unknown, string]> = [
     [
@@ -715,7 +746,10 @@ describe('pre-tool-use.sh — a block says which kind of block it is', () => {
   test('an unquoted chat id still gets its rules', () => {
     writeFileSync(
       policyPath,
-      'version: 1\nchats:\n  164795011:\n    deny:\n      bash_patterns:\n        - "sudo"\n',
+      // The id is UNQUOTED on purpose — that is the whole test.
+      policyOf(
+        entry('164795011', ['    deny:', '      bash_patterns:', '        - "sudo"'].join('\n')),
+      ).replace('"164795011":', '164795011:'),
       'utf8',
     )
     const r = run(
@@ -899,19 +933,13 @@ describe('pre-tool-use.sh — a block says which kind of block it is', () => {
   test("a chat executes its own deny list, not the neighbour's", () => {
     writeFileSync(
       policyPath,
-      [
-        'version: 1',
-        'chats:',
-        '  "164795011":',
-        '    deny:',
-        '      bash_patterns:',
-        '        - "mine-only"',
-        '  "999":',
-        '    deny:',
-        '      bash_patterns:',
-        '        - "theirs-only"',
-        '',
-      ].join('\n'),
+      policyOf(
+        entry(
+          '164795011',
+          ['    deny:', '      bash_patterns:', '        - "mine-only"'].join('\n'),
+        ),
+        entry('999', ['    deny:', '      bash_patterns:', '        - "theirs-only"'].join('\n')),
+      ),
       'utf8',
     )
     const env = {
@@ -1032,6 +1060,38 @@ describe('pre-tool-use.sh — a block says which kind of block it is', () => {
     })
   }
 
+  // codex round 9. The first version of the key check took only the unknown
+  // half, arguing that the hook never READS `persona_file` so it should not
+  // refuse over it. That argument does not follow from the coercion problem —
+  // a name is present or it is not, nothing coerces — and it left the gate
+  // applying files the loader would have rejected, against the invariant this
+  // very loop is built on.
+  test('a chat entry missing schema-required keys is refused', () => {
+    writeFileSync(
+      policyPath,
+      // Everything the schema wants except `persona_file` and `system_reminder`.
+      policyOf(
+        entry('164795011', ['    deny:', '      bash_patterns:', '        - "rm"'].join('\n'))
+          .replace('    persona_file: persona.md\n', '')
+          .replace('    system_reminder: ""\n', ''),
+      ),
+      'utf8',
+    )
+    const r = run(
+      PRE_HOOK,
+      {
+        MULTICHAT_STATE_DIR: workspace,
+        CLAUDE_WORKSPACE_DIR: workspace,
+        CHAT_ID: '164795011',
+      },
+      JSON.stringify({ tool_name: 'Bash', tool_input: { command: 'ls' } }),
+    )
+    expect(r.code).toBe(2)
+    const payload = JSON.parse(r.stdout)
+    expect(payload.denied_by).toBe('hook-failure')
+    expect(payload.reason).toContain('missing keys: persona_file, system_reminder')
+  })
+
   // …and the other direction, which is the whole reason the check is on NAMES
   // and not on values: every field the schema does allow must pass. PyYAML
   // reads YAML 1.1, so `streaming: off` arrives here as the boolean False while
@@ -1093,14 +1153,35 @@ describe('pre-tool-use.sh — a block says which kind of block it is', () => {
   // hook would make the hook refuse every call in every chat, live, with a
   // correct file on disk. That failure belongs in CI, not in the operator's
   // evening — so the two lists are compared directly, in the same repo.
-  test('the hook’s chat-entry key list matches ChatPolicySchema exactly', async () => {
+  test('the hook’s chat-entry key lists match ChatPolicySchema exactly', async () => {
     const { ChatPolicySchema } = await import('../../src/chats/policy-loader')
-    const fromSchema = Object.keys(ChatPolicySchema.shape).sort()
     const hookSource = readFileSync(PRE_HOOK, 'utf8')
-    const block = hookSource.match(/CHAT_KEYS = \(([\s\S]*?)\)/)
-    expect(block).not.toBeNull()
-    const fromHook = [...(block?.[1] ?? '').matchAll(/'([a-z_]+)'/g)].map((m) => m[1]).sort()
-    expect(fromHook).toEqual(fromSchema)
+
+    function namesIn(constant: string): string[] {
+      const block = hookSource.match(new RegExp(`${constant} = \\(([\\s\\S]*?)\\)`))
+      expect(`${constant} found: ${block !== null}`).toBe(`${constant} found: true`)
+      return [...(block?.[1] ?? '').matchAll(/'([a-z_]+)'/g)].map((m) => m[1] ?? '').sort()
+    }
+
+    // Both halves, because they carry different weight. A name missing from
+    // CHAT_KEYS makes the hook refuse a legal file; a name wrongly in
+    // CHAT_REQUIRED does the same for a file that omits an optional field. The
+    // schema decides which is which: `.isOptional()` covers both `.optional()`
+    // and `.default()`, which is exactly the split the hook needs.
+    const shape = ChatPolicySchema.shape as Record<string, { isOptional(): boolean }>
+    const required = namesIn('CHAT_REQUIRED')
+    const optional = namesIn('CHAT_OPTIONAL')
+
+    expect(required).toEqual(
+      Object.entries(shape)
+        .filter(([, field]) => !field.isOptional())
+        .map(([name]) => name)
+        .sort(),
+    )
+    expect([...required, ...optional].sort()).toEqual(Object.keys(shape).sort())
+    // …and the hook must actually build its accepted set from both, or the two
+    // lists above could be perfect while the check used only one of them.
+    expect(hookSource).toContain('CHAT_KEYS = CHAT_REQUIRED + CHAT_OPTIONAL')
   })
 
   // The 1-based position is the ONLY navigation the operator gets, because the
@@ -1109,17 +1190,18 @@ describe('pre-tool-use.sh — a block says which kind of block it is', () => {
   test('the rule position points at the rule that fired', () => {
     writeFileSync(
       policyPath,
-      [
-        'version: 1',
-        'chats:',
-        '  "164795011":',
-        '    deny:',
-        '      bash_patterns:',
-        '        - "first-rule"',
-        '        - "second-rule"',
-        '        - "third-rule"',
-        '',
-      ].join('\n'),
+      policyOf(
+        entry(
+          '164795011',
+          [
+            '    deny:',
+            '      bash_patterns:',
+            '        - "first-rule"',
+            '        - "second-rule"',
+            '        - "third-rule"',
+          ].join('\n'),
+        ),
+      ),
       'utf8',
     )
     const r = run(
@@ -1141,7 +1223,10 @@ describe('pre-tool-use.sh — a block says which kind of block it is', () => {
   test('another chat with no deny block at all is fine', () => {
     writeFileSync(
       policyPath,
-      'version: 1\nchats:\n  "164795011":\n    deny:\n      bash_patterns:\n        - "rm"\n  "999":\n    persona_file: "persona.md"\n',
+      policyOf(
+        entry('164795011', ['    deny:', '      bash_patterns:', '        - "rm"'].join('\n')),
+        entry('999'),
+      ),
       'utf8',
     )
     const r = run(

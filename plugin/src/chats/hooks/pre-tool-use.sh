@@ -214,11 +214,13 @@ except Exception:  # noqa: BLE001
 
 DENY_KEYS = ('mcp_tools', 'read_paths', 'bash_patterns')
 
-# Every key name `ChatPolicySchema` allows in a chat entry, and nothing else.
-# A name outside this set is refused; whether a name inside it is PRESENT is the
-# loader's business, not this hook's. See validated_deny() for both halves of
-# that reasoning.
-CHAT_KEYS = (
+# The chat-entry key names of `ChatPolicySchema`, split the way the schema
+# splits them. REQUIRED is what it has no default for; OPTIONAL is `deny` plus
+# the two fields it defaults, which a live file may legitimately omit.
+#
+# Both lists are pinned to the schema by a test, so a field added there reddens
+# CI here instead of locking every live chat.
+CHAT_REQUIRED = (
     'mode',
     'streaming',
     'tmux_mirror',
@@ -227,10 +229,9 @@ CHAT_KEYS = (
     'persona_file',
     'handoff_file',
     'system_reminder',
-    'deny',
-    'idle_ttl_ms',
-    'max_queue_depth',
 )
+CHAT_OPTIONAL = ('deny', 'idle_ttl_ms', 'max_queue_depth')
+CHAT_KEYS = CHAT_REQUIRED + CHAT_OPTIONAL
 
 
 def validated_deny(raw_policy: object, wanted_chat: str) -> dict:
@@ -362,19 +363,28 @@ def validated_deny(raw_policy: object, wanted_chat: str) -> dict:
             problems.append(f'{where}: entry is not a mapping')
             continue
 
-        # An unknown key name in the entry. `deney: {...}` is the whole reason:
-        # it reads like a rule block, leaves `deny` absent, and hands the chat no
-        # restrictions at all — the `bash_patern:` fail-open one level up, in a
-        # file the loader's `.strict()` would have thrown on.
+        # Key NAMES against the schema, both directions.
         #
-        # Presence of the schema's OWN names is deliberately not checked. A file
-        # missing `persona_file` is rejected by the loader before any session
-        # exists, and this hook reads none of those fields; refusing over them
-        # would be a NEW way for the gate to lock a working system, bought with
-        # no gate safety at all.
-        stray = sorted({str(k) for k in value} - set(CHAT_KEYS))
+        # Unknown names first, because `deney: {...}` is the fail-open that
+        # started this: it reads like a rule block, leaves `deny` absent, and
+        # hands the chat no restrictions at all — `bash_patern:` one level up.
+        #
+        # Missing required names second. The first version of this check left
+        # them out, on the argument that the hook does not READ `persona_file`
+        # so it should not refuse over it. That argument is wrong twice: it does
+        # not follow from the coercion problem below (a key name is present or
+        # it is not — nothing coerces), and it quietly contradicts the invariant
+        # this loop is built on. A file the loader would reject stays a file
+        # this hook refuses; the two say the same thing about the same file, and
+        # the operator is not left with a gate applying a policy the server
+        # would not have loaded.
+        entry_keys = {str(k) for k in value}
+        stray = sorted(entry_keys - set(CHAT_KEYS))
         if stray:
             problems.append(f'{where}: unknown keys: ' + ', '.join(stray))
+        missing = [name for name in CHAT_REQUIRED if name not in entry_keys]
+        if missing:
+            problems.append(f'{where}: missing keys: ' + ', '.join(missing))
 
         # An ABSENT `deny` is legitimate -- no rules for this chat has always
         # meant no denials. A `deny:` written with no value is not the same
